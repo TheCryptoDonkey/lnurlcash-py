@@ -5,13 +5,19 @@ from __future__ import annotations
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .errors import ProtocolError
-from .recoverable import decode_cs1_with_amount, is_cp1, is_cs1_with_amount, note_id_of
+from .recoverable import decode_cs1_with_amount, is_cp1, is_cs1_with_amount, verify_spend
 from .secrets import is_preimage
 from .urls import from_lud17, resolve_lnurl_input
 
 
 def _query_pairs(url: str) -> list[tuple[str, str]]:
     return parse_qsl(urlparse(url).query, keep_blank_values=True)
+
+
+# LUD-25 names the certificate ``c``. ``sig`` is what earlier drafts called it,
+# and is still READ so notes and mints from before the rename keep working;
+# nothing here writes it.
+_CERT_KEYS = ("c", "sig")
 
 
 def _first(url: str, key: str) -> str | None:
@@ -62,7 +68,7 @@ def note_declared_amount(url: str) -> int | None:
     except ValueError:
         return None
     if raw is None:
-        signature = _first(url, "sig")
+        signature = note_signature(url)
         certificate = decode_cs1_with_amount(signature) if signature else None
         return certificate.amount_msat if certificate is not None else None
     try:
@@ -76,24 +82,27 @@ def note_declared_amount(url: str) -> int | None:
 
 
 def note_signature(url: str) -> str | None:
+    """The certificate a note URL carries: ``c``, or the legacy ``sig``."""
     try:
-        return _first(url, "sig")
+        return _first(url, "c") or _first(url, "sig")
     except ValueError:
         return None
 
 
 def resolve_note_input(value: str) -> str | None:
-    """Input only qualifies as a note if it resolves to a URL carrying a
-    well-formed k1: 32 bytes hex, or a Part 2 ck1 with a valid key/signature
-    pair.
-    Anything else would raise during hashing later, so it is refused at the
-    door. A cp1 is a note's public key, not its secret, so it does not
+    """Input only qualifies as a note if it resolves to a URL whose k1 is a
+    spend that opens its note at the URL's own domain
+    (:func:`~lnurlcash_kit.recoverable.verify_spend`): a bearer preimage or
+    cw1, or a ck1 signed for this mint. A ck1 signed for another mint could
+    never be redeemed here, so it is refused at the door. A cw1 whose leaf
+    this library cannot run passes on its structure alone; the mint judges
+    the rest. A cp1 is a note's public name, not a spend, so it does not
     qualify."""
     url = resolve_lnurl_input(value)
     if not url:
         return None
     k1 = note_k1(url)
-    if not k1 or note_id_of(k1) is None:
+    if not k1 or verify_spend(k1, url) is None:
         return None
     return url
 
@@ -118,37 +127,33 @@ def build_note_url(
 
 
 def build_note_info_url_by_hash(withdraw_link: str, h: str) -> str:
-    """The informational GET for a note named by its HASH rather than its
-    secret.
+    """The informational GET for a note named by its public name rather than
+    a spend of it.
 
-    LUD-25's "Checking a note without exposing it": a SERVICE MAY accept
-    ``?h=<hex sha256 of k1>`` in place of ``?k1=``, on the informational GET
-    only and never at the callback. It already stores every note under that
-    hash, so this is a second way into a lookup it can do anyway - and the
-    secret stays off the wire, which is what a restore walk needs, since a walk
+    LUD-25's "Checking a note without exposing it": a SERVICE MUST accept
+    ``?p=<cp1>`` in place of ``?k1=``, or a bearer note's hex ``h`` as its
+    short form, on the informational GET only and never at the callback. The
+    spend stays off the wire, which is what a restore walk needs, since a walk
     queries a whole gap window of indices the wallet has not minted into yet.
 
-    ``k1``, ``amount`` and ``sig`` are dropped: naming the note twice, once in
+    ``k1``, ``amount`` and the certificate (``c``, or legacy ``sig``) are dropped: naming the note twice, once in
     a form that spends it, would defeat the point.
 
-    A SERVICE that does not index by hash answers exactly as it answers for an
-    unknown ``k1``, which LUD-25 requires, so a rejection here never
-    distinguishes "not supported" from "no such note" - and a burned note is
-    deliberately indistinguishable from one that never existed.
+    An unknown note is answered exactly as an unknown ``k1`` is, and a burned
+    note is deliberately indistinguishable from one that never existed.
 
-    ``h`` may also be a Part 2 cp1 key, sent as ``p``, the name LUD-25 now
-    uses. A hash keeps the older ``h``, which every mint that ever took a hash
-    lookup understands. Same rule as lnurl-wallet, decided per value rather
-    than by a version flag. :func:`~lnurlcash_kit.recoverable.note_lookup_of`
-    gives the right one for either kind of k1.
+    ``h`` is a cp1 or a bearer note's hex ``h``, and goes as ``p`` either way.
+    Mints from before LUD-25 settled on ``p`` also read ``h``, but every
+    current one reads ``p`` for both.
+    :func:`~lnurlcash_kit.recoverable.note_lookup_of` gives the right value
+    for any k1.
     """
     value = h.strip().lower()
-    key = is_cp1(value)
-    if not key and not is_preimage(value):
-        raise ProtocolError("a note hash must be 32 bytes of hex, or a cp1 key")
+    if not is_cp1(value) and not is_preimage(value):
+        raise ProtocolError("a note lookup is a bearer note's 32-byte hex h, or a cp1")
     url = from_lud17(withdraw_link.strip())
-    pairs = [(k, v) for k, v in _query_pairs(url) if k not in ("k1", "amount", "sig")]
-    pairs.append(("p" if key else "h", value))
+    pairs = [(k, v) for k, v in _query_pairs(url) if k not in ("k1", "amount", *_CERT_KEYS)]
+    pairs.append(("p", value))
     return _rebuild(url, pairs)
 
 
@@ -158,7 +163,7 @@ def with_new_k1(
     """The same note with its secret swapped out, after a rotate, split or
     merge. A signature only carries over when the response actually returned a
     fresh one: a mutation at a SERVICE without offline verification drops any
-    stale sig, since it no longer matches the new secret."""
+    stale certificate, since it no longer matches the new secret."""
     amount_is_implied = bool(signature) and is_cs1_with_amount(signature)
     pairs: list[tuple[str, str]] = []
     replaced = {"k1": False, "amount": False, "sig": False}
@@ -170,9 +175,10 @@ def with_new_k1(
             if not amount_is_implied:
                 pairs.append((key, str(amount_msat)))
                 replaced["amount"] = True
-        elif key == "sig":
-            if signature:
-                pairs.append((key, signature))
+        elif key in _CERT_KEYS:
+            # a legacy ``sig`` is rewritten as ``c``
+            if signature and not replaced["sig"]:
+                pairs.append(("c", signature))
                 replaced["sig"] = True
         else:
             pairs.append((key, value))
@@ -181,7 +187,7 @@ def with_new_k1(
     if not replaced["amount"] and not amount_is_implied:
         pairs.append(("amount", str(amount_msat)))
     if signature and not replaced["sig"]:
-        pairs.append(("sig", signature))
+        pairs.append(("c", signature))
     return _rebuild(url, pairs)
 
 
@@ -200,14 +206,15 @@ def without_k1(url: str, amount_msat: int, signature: str | None = None) -> str:
             if not amount_is_implied:
                 pairs.append((key, str(amount_msat)))
                 seen_amount = True
-        elif key == "sig":
-            if signature:
-                pairs.append((key, signature))
+        elif key in _CERT_KEYS:
+            # a legacy ``sig`` is rewritten as ``c``
+            if signature and not seen_sig:
+                pairs.append(("c", signature))
                 seen_sig = True
         else:
             pairs.append((key, value))
     if not seen_amount and not amount_is_implied:
         pairs.append(("amount", str(amount_msat)))
     if signature and not seen_sig:
-        pairs.append(("sig", signature))
+        pairs.append(("c", signature))
     return _rebuild(url, pairs)

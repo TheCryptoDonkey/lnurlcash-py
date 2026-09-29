@@ -7,8 +7,22 @@ pip install lnurlcash-kit
 ## What this is
 
 LNURLcash notes are LUD-03 withdrawRequest links whose k1 IS the asset:
-lnurlw://mint.example/w?k1=<32-byte-hex>&amount=<msat>. Whoever knows the k1
-can spend it. Amounts are ALWAYS integer milli-satoshis.
+lnurlw://mint.example/w?k1=<spend>&amount=<msat>. Whoever knows the k1 can
+spend it. Amounts are ALWAYS integer milli-satoshis.
+
+LUD-25 (luds 6e865b1): every note is a BIP-341 taproot output key Q, named
+cp1<Q>, filed by the mint under hex(Q). A k1 is a SPEND of it:
+  64 hex    a bearer note's preimage: short form of the cw1 for the leaf
+            OP_SHA256 <h> OP_EQUAL under the BIP-341 NUMS key. Signs nothing,
+            so it spends at ANY mint holding the note
+  ck1       Q || BIP-340 sig over the key-path sighash of a fixed transaction
+            whose prevout is tagged_hash("LNURLcash/mint", domain). Spends at
+            THAT mint only. Signing and verifying need the mint's domain
+  cw1       leaf, control block, witness; Q recomputed from the control block
+An output (p1/p2, a lookup's p, a mint comment) is a cp1 or a bearer note's
+hex h = sha256(preimage), the short form of its cp1. note_id_of(k1) is hex(Q),
+NOT sha256(k1). Domains: any URL or bare host, reduced to the lowercase
+hostname (no scheme, no port) by spend_domain_of.
 
 Draft spec: https://github.com/lnurl/luds/pull/301
 Reference mint: https://github.com/dni/lnurl-mint
@@ -21,7 +35,7 @@ client = LnurlcashClient(timeout=30.0, offline=False, rng=generate_note_secret,
                          policy=Policy(), mutation_retries=1)
 Policy(require_signatures=False, require_mint_pubkey=True) is the default.
 
-client.fetch_note_info(url) -> WithdrawRequestInfo(callback, k1, max_withdrawable, mint_pubkey)
+client.fetch_note_info(url) -> WithdrawRequestInfo(callback, k1, max_withdrawable, mint_pubkey, signature)
 client.rotate_note(callback, k1) -> RotateResult(k1, signature)
 client.split_note(callback, k1s, amount_msat) -> SplitResult(k1, change, signature, change_signature)
 client.merge_notes(callback, k1s) -> RotateResult
@@ -31,8 +45,11 @@ client.probe_burned_note(url) -> 'live' | 'gone' | 'unknown'
 client.fetch_pay_request(url) / request_invoice(cb, msat) / fetch_invoice_verification(url)
 client.fetch_mint_address(url)
 
-verify_note_signature(k1, amount_msat, sig_hex, mint_pubkey_hex) -> bool
-  k1 may be a ck1 and sig a cs1 (LUD-25 Part 2, below)
+verify_note_signature(k1, domain, amount_msat, sig, mint_pubkey_hex) -> Certification
+  checks k1 opens its Q at domain, then the cs1 over hex(Q); a bearer note
+  falls back to its h (CERTIFIED_OVER_HASH, a pre-taproot mint). Only
+  NOT_CERTIFIED is falsy
+verify_note_url(note_url, mint_pubkey) -> (amount_msat | None, Certification)
 resolve_note_input(text) / resolve_mint_input(text) / resolve_lnurl_input(text)
 parse_mint_fee(metadata) / apply_mint_fee(gross, fee) / gross_up_for_mint_fee(net, fee)
 
@@ -46,31 +63,34 @@ returns Request(url, parse, new_secrets) and performs no I/O.
 1. max_withdrawable from fetch_note_info is the ONLY authoritative value. The
    `amount` in a note URL is an unverified claim.
 2. On rotate/split/merge the WALLET generates the replacement secret and
-   discloses only sha256(secret). Never accept a service-supplied k1.
+   discloses only its public name (a bearer h, or a cp1). Never accept a
+   service-supplied k1. A ck1 is per mint: sign it for the mint's domain.
 3. Catch AmbiguousMutation, PERSIST err.new_secrets before anything else, then
    call probe_burned_note. Treating it as failure destroys money the service
    may already have minted.
 4. RequestRefused means nothing was sent - safe to treat as a no-op.
 5. A melt's OK means IN FLIGHT, not spent. NotePending means retry, not spent.
-5b. Legacy hashes and cp1 outputs use different proofs. A rotate/split/merge
-   to a cp1 output (p1, or
-   p2 for a split's change) MUST return its cs1 in sig (sig2 for the change),
-   and a missing one raises UnverifiableNote WHATEVER the policy says. A hash
-   legacy hash uses the raw Part 1 signature when available; the tolerant
-   default admits signature None in no-signer mode.
+5b. A mint SHOULD certify every note with a cs1 over hex(Q), a bearer note
+   included. A rotate/split/merge to an output named by a cp1 (p1, or p2 for
+   a split's change) MUST return its cs1 in c (c2 for the change; a pre-50d740a mint's sig/sig2
+   are still read, never sent) - this
+   library's rule, stricter than LUD-25's SHOULD - and a missing one raises
+   UnverifiableNote WHATEVER the policy says. An output named by a bearer h
+   may come back with signature None from a mint with no signer.
    UnverifiableNote means the mutation LANDED, so keep its secrets (empty
    after a *_with_hash call: the caller already holds that key).
-   Policy(require_signatures=True) demands the raw Part 1 signature over a
-   hash, matching the committed reference wallet. Policy(require_mint_pubkey=True), the default, refuses a
-   withdrawRequest with no valid mintPubkey; set False for a Part 1-only mint.
+   Policy(require_signatures=True) demands a certificate for a bearer h
+   output too. Policy(require_mint_pubkey=True), the default, refuses a
+   withdrawRequest with no valid mintPubkey.
 5c. A retried rotate/split/merge MUST be answered by the service as a replay of
    the original success, so a client re-sends one whose answer was lost
    (mutation_retries, default 1) and usually completes it. NEVER a melt. The
-   IDENTICAL request goes out: the replay is matched on the k1 set, h, h2 and
-   amount, so a fresh secret would make it a different mutation.
+   IDENTICAL request goes out: the replay is matched on the notes the k1s
+   open, p1, p2 and amount, so a fresh secret would make it a different
+   mutation.
 6. Rotate immediately after claiming a minted note: the mint generated that
    preimage, and LUD-21 verify exposes it to anyone who saw the invoice.
-7. Never log note URLs. The secret is in the query string.
+7. Never log note URLs. The spend is in the query string.
 8. Never branch on exception message text. Branch on the class.
 
 ## Errors
@@ -78,8 +98,8 @@ returns Request(url, parse, new_secrets) and performs no I/O.
 RequestRefused     nothing sent, note untouched
 ServiceRejected    processed and refused (definitive)
   NotePending      a melt is in flight on this k1 - retry
-UnverifiableNote   the mutation LANDED without a signature it owed: a cp1
-                   output's cs1, or a hash output's Part 1 signature under
+UnverifiableNote   the mutation LANDED without a certificate it owed: for an
+                   output named by cp1, or by a bearer h under
                    require_signatures=True. The note is REAL; carries
                    .new_secrets - persist them
 new_secrets_of(err) the secrets carried by ANY exception that could describe a
@@ -87,6 +107,8 @@ new_secrets_of(err) the secrets carried by ANY exception that could describe a
                    or unknown
   NoteSpent        authoritative: already burned
   NoteUnknown      service does not recognise it
+  OutputInUse      "already in use": a p1/p2 is taken. Nothing burned; name
+                   a fresh output (the next index)
 AmbiguousMint      outcome UNKNOWN - assume nothing
   AmbiguousMutation  carries .new_secrets - persist them
 ProtocolError      a non-mutating response did not match the spec
@@ -102,63 +124,94 @@ derive_cash_domain_node(root, host) -> CashNode m/139'/d1/d2/d3/d4, d1..d4 =
   RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
   the host name. NEVER mask the top bit, NEVER harden all four - either
   derives a different tree and restores nothing, silently.
-  This node IS the Part 2 address branch.
-Part 1 secrets are plain randomness (generate_note_secret), not seed-derived.
+  This node IS the key-path notes' address branch.
+Bearer preimages are plain randomness (generate_note_secret), not seed-derived.
 cash_node_to_hex / cash_node_from_hex   privateKey || chainCode, 64 bytes
 derive_cash_child(node, raw_uint32)     BIP-32 CKDpriv, for checking this
   library against BIP-32's own vectors
 derive_note_root / derive_note_secret   LEGACY pre-spec HMAC scheme. Do not
   mint under it; still scanned so old notes stay findable.
 build_note_info_url_by_hash(link, h) / note_info_by_hash_request(link, h)
-  the ?h= informational GET, so a restore walk keeps secrets off the wire.
-  A rejection proves nothing: unsupported, unknown and BURNED are one answer.
+  the ?p= informational GET (h a cp1 or a bearer h), so a restore walk keeps
+  spends off the wire. Unknown and BURNED are one answer.
 
-LUD-25 Part 2, notes keyed by a public key (lnurlcash_kit.recoverable):
-The holder keeps sk and discloses pk as cp1. The k1 that SPENDS the note is a
-ck1: pk || BIP-340 Schnorr sig by sk over sha256("LNURLcash"). cs1 is the mint's
-certificate, cx1 a watch-only branch (x-only pubkey || chain code). All four
-are bech32m, fixed length, no 90-char limit, upper case fine, mixed case
-refused. Decoders return None, never raise.
+Spends (lnurlcash_kit.spend, lnurlcash_kit.recoverable):
+verify_spend(k1, domain) -> VerifiedSpend(output_key, legacy, unevaluated) | None
+  opens which Q at this mint, as a mint would, time claims aside. legacy: an
+  old ck1 (fixed message, or 65-byte ECDSA) - rotate it. unevaluated: a cw1
+  whose leaf is not a bearer hashlock - structure, Q and leaf rules only
+decode_spend(k1) -> Spend(kind: SpendKind, output_key, signature, script_path) | None
+note_id_of(k1) -> hex(Q) | None   compare notes by this, NEVER by k1. Names,
+  does not verify. fetch_note_info's echo check verifies at the note's domain
+note_lookup_of(k1) -> a bearer preimage's h, else cp1<Q>; for note_info_by_hash_request
+spend_domain_of(url or host) -> lowercase hostname
+spend_prevout(domain), spend_sig_msg(Q, domain, locktime, sequence, leaf=None),
+  key_path_sighash(Q, domain), script_path_sighash(Q, domain, leaf, lt, seq)
+  SIGHASH_DEFAULT, input 0, hand-rolled; spec vector 3 pins every field
+tap_leaf_hash(script, version=0xc0), taproot_tweak(P, merkle_root=b"") ->
+  (Q, odd_y), output_key_of(script, control_block) -> Q | None (merkle fold,
+  tweak, parity CHECKED), is_x_only_point(x), NUMS_KEY, TAPLEAF_VERSION
+bearer_leaf(h), bearer_note(h) -> BearerNote(output_key, control_block, leaf),
+  bearer_note_id(hex h) -> hex(Q), bearer_cw1(preimage) -> the full cw1
+Cw1(locktime, sequence, script, control_block, witness); encode_cw1 /
+  decode_cw1 (structure only) / is_cw1 / output_key_of_cw1. Big-endian
+  u32 u32 (u16 len item)*
+check_leaf_policy(version, script) -> reason | None  refuses leaf version !=
+  0xc0 and any OP_SUCCESSx outside pushed data
+check_time_claim(locktime, sequence, now, locked_at) -> reason | None  the
+  mint's clock rules; custodial, never trustless
+No script interpreter.
+
+Key-path notes and the wire values (lnurlcash_kit.recoverable):
+All of cp1, ck1, cw1, cs1, cx1 are bech32m, no 90-char limit, upper case fine,
+mixed case refused. Decoders return None, never raise.
 encode_cp1/ck1(bytes) -> str       decode_cp1/ck1(str) -> bytes | None
-  encode_ck1 takes the current 96 bytes only; decode_ck1/is_ck1 also accept
+  decode_cp1 refuses a key that is not a curve point
+  encode_ck1 takes the 96 bytes Q || sig only; decode_ck1/is_ck1 also accept
   the LEGACY 65-byte recoverable-ECDSA ck1 so an old note can be rotated
 encode_cs1_with_amount(amount_msat, sig) / decode_cs1_with_amount -> Cs1
   CURRENT: HRP is "cs" plus the BOLT11 amount suffix; signature covers
-  LNURLcash:<amount_msat>:<hex(pk)>.
+  LNURLcash:<amount_msat>:<hex(Q)>.
 encode_cs1/decode_cs1/is_cs1 are LEGACY fixed-HRP only.
 decode_any_cs1/is_any_cs1 accept either certificate during migration.
 encode_cx1(pubkey_x_only, chain_code) / decode_cx1(str) -> Cx1 | None
-is_cp1 / is_ck1 / is_cs1_with_amount / is_cx1(str) -> bool
+is_cp1 / is_ck1 / is_cw1 / is_cs1_with_amount / is_cx1(str) -> bool
 derive_cash_address_node(root, host) -> CashNode   m/139'/d1/d2/d3/d4, hashing
   key m/139'/0: the spec's literal path, the same node derive_cash_domain_node
   returns.
 cash_node_to_cx1(node) -> Cx1   hand this out, never the node
-derive_note_pubkey(branch_pubkey_x_only, chain_code, i) -> 32-byte x-only
-  watch-only. t = tagged_hash("LNURLcash/derive", P || chain_code ||
-  ser32_be(i)); i is any uint32, never hardened. t >= n or a zero key raises
-  ProtocolError: use the next i. Never reduced.
-derive_note_secret_key(branch_private_key, chain_code, i) -> 32 bytes
-sign_note_ownership(sk) -> 96 bytes pk || BIP-340 sig over sha256("LNURLcash"),
-  zero auxiliary input so seed recovery reproduces the ck1
-note_ownership_message() -> b"LNURLcash"
-address_proof_message(action, username) -> "LNURLcash:<register|unregister>:<normalised username>"
-address_proof_digest(action, username) -> sha256 of that message
-sign_address_proof(index_zero_sk, action, username) -> 64-byte BIP-340 over the digest
-recover_note_ownership_pubkey(payload) -> x-only pk | None   verifies a 96-byte
-  payload against the sha256 digest, then the pre-2026-09-16 raw message;
-  recovers a legacy 65-byte one
-note_id_of(k1) -> sha256 hex for a hex k1, verified pk hex for a ck1, else None
-  Compare notes by this, never by k1. fetch_note_info's echo check does:
-  another valid ck1 for the same key passes, a different note is refused.
-note_lookup_of(k1) -> the hash, or the cp1 for a ck1. Pass it to
-  note_info_by_hash_request: a cp1 goes as ?p=, a hash as ?h=. The answer's
-  .signature is the note's cs1.
-Wire: a ck1 goes anywhere a k1 does (note URL, fetch_note_info, rotate, split,
-  merge, melt). A cp1 output goes as p1/p2 from the *_with_hash calls, while a
-  hash keeps h/h2. mint_invoice_request_with_hash sends a cp1 as the comment
-  alone.
-verify_note_signature_hash(pk_hex, amount_msat, cs1, mint_pubkey) -> bool
-  for a cx1 watcher, which has the key but never a ck1
+derive_note_pubkey(branch_pubkey_x_only, chain_code, i, purpose=PURPOSE_WALLET)
+  -> 32-byte x-only Q, used as is (no BIP-86 tweak). watch-only.
+  t = tagged_hash("LNURLcash/derive", P || chain_code || ser32_be(purpose) ||
+  ser32_be(i)); purpose and i are any uint32, never hardened. t is reduced
+  mod n; a zero key raises ProtocolError: use the next i.
+  PURPOSE_WALLET=0 (the wallet's own notes and a split's p1), PURPOSE_CHANGE=1
+  (a split's p2), PURPOSE_LIGHTNING_ADDRESS=2 (auto-mint and internal
+  transfer). One counter per purpose; recovery scans each. The address proof
+  and the address key are purpose 0, index 0.
+derive_note_secret_key(branch_private_key, chain_code, i, purpose=PURPOSE_WALLET)
+  -> 32 bytes
+sign_note_ownership(sk, domain) -> 96 bytes Q || BIP-340 sig over
+  key_path_sighash(Q, domain), zero aux_rand: one deterministic ck1 per mint
+recover_note_ownership_pubkey(payload, domain) -> NoteOwnership(pubkey_x_only,
+  legacy) | None   the domain's sighash, else the old fixed messages
+  (legacy); a 65-byte ECDSA payload is recovered (legacy)
+address_proof_message(action, domain, username) ->
+  "LNURLcash:<register|unregister>:<domain>:<normalised username>"
+address_proof_digest(action, domain, username) -> sha256 of that message
+sign_address_proof(index_zero_sk, action, domain, username) -> 64-byte BIP-340
+Wire: a spend goes anywhere a k1 does (note URL, fetch_note_info, rotate,
+  split, merge, melt). An output (cp1 or bearer h) goes as p1/p2 from the
+  *_with_hash calls, p on a lookup, the comment on a mint invoice (a bearer h
+  also as h). An off-curve cp1 is refused before sending.
+Certificates (lnurlcash_kit.signature), cs1 over "LNURLcash:<amount_msat>:<hex(Q)>":
+  verify_note_signature(k1, domain, amount_msat, sig, mint_pubkey)
+  verify_note_signature_hash(h, ...)       a bearer note by its h: Q, then h
+  verify_note_signature_for_key(hex_q, ...) a watcher with no spend
+  verify_note_url(note_url, mint_pubkey)
+  -> Certification.CERTIFIED_OVER_Q | CERTIFIED_OVER_HASH | NOT_CERTIFIED
+  note_signature_message(k1, amt), note_signature_message_for_hash(hex_id,
+    amt), and the digest pair: the message over a note's hex id
 derive_cash_master(seed) -> CashNode   BIP-32 master, for paths not named here
 EXTENSION, not LUD-25: derive_nostr_cash_seed(sk) = HMAC-SHA256(key = sk,
   msg = "LNURLcash/nostr-seed"); derive_nostr_address_node(sk, host) = the

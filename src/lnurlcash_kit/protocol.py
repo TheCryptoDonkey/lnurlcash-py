@@ -30,7 +30,7 @@ from .errors import (
 from .fees import _MAX_SAFE_INT, MintFee, parse_mint_fee
 from .bolt11 import decode_bolt11_amount_msat
 from .note import note_k1
-from .recoverable import is_cp1, note_id_of
+from .recoverable import is_cp1, verify_spend
 from .secrets import generate_note_secret, hash_k1, is_preimage
 from .urls import is_allowed_service_url
 
@@ -41,9 +41,9 @@ class Request:
 
     url: str
     parse: Callable[[Any], Any]
-    #: fresh WALLET-generated secrets this request disclosed the hashes of.
-    #: If the outcome is unknown they may be the only copies of notes the
-    #: SERVICE has already minted, so they must ride the failure out.
+    #: fresh WALLET-generated bearer preimages this request disclosed the
+    #: hashes of. If the outcome is unknown they may be the only copies of
+    #: notes the SERVICE has already minted, so they must ride the failure out.
     new_secrets: list[str] = field(default_factory=list)
     #: whether a client may re-send this request when the transport loses its
     #: answer. True for a rotate, split or merge, which LUD-25 requires a
@@ -58,32 +58,31 @@ class Request:
 class Policy:
     """What this library insists a SERVICE does, rather than merely hopes.
 
-    LUD-25 Part 2 certifies ``cp1`` notes only. A rotate, split or merge to a
-    ``cp1`` output MUST come back with its ``cs1`` certificate in ``sig``
-    (``sig2`` for a split's change), and this library always insists on that:
-    nothing here turns it off, because a ``cp1`` note nobody can check offline
-    is missing the one thing it is for. A legacy hash output carries the raw
-    Part 1 signature when the reference mint has a signer and may be unsigned
-    in its no-signer mode.
+    LUD-25 has a SERVICE certify every note it issues (a SHOULD), a bearer
+    note included, since every note now has a public ``Q``. This library goes
+    further for an output the caller named by ``cp1``: a rotate, split or
+    merge to one MUST come back with its ``cs1`` in ``c`` (``c2`` for a
+    split's change), because offline verification is the reason to name a
+    note that way, and nothing here turns it off. An output named by a bearer
+    note's hex ``h`` may come back uncertified, as it does from a mint with no
+    signer.
 
-    ``require_signatures`` demands the raw Part 1 signature over a legacy hash
-    output, matching the committed reference wallet. It is off by default to
-    admit the reference mint's no-signer mode.
+    ``require_signatures`` demands a certificate for an output named by a
+    bearer ``h`` too. It is off by default to admit a mint with no signer.
 
     ``require_mint_pubkey`` refuses a ``withdrawRequest`` that publishes no
-    valid ``mintPubkey``, the key a ``cp1`` note's certificate verifies
-    against. On by default. Set it false only for a Part 1-only SERVICE that
-    publishes none, knowing that nothing it issues can then be checked
-    offline.
+    valid ``mintPubkey``, the key every certificate verifies against. On by
+    default. Set it false only for a SERVICE that publishes none, knowing
+    that nothing it issues can then be checked offline.
     """
 
     require_signatures: bool = False
     require_mint_pubkey: bool = True
 
 
-#: What a caller gets without stating a policy: a ``cs1`` on every ``cp1``
-#: output, a ``mintPubkey`` on every ``withdrawRequest``, and a plain note
-#: taken as the unsigned thing it is.
+#: What a caller gets without stating a policy: a ``cs1`` on every output
+#: named by ``cp1``, a ``mintPubkey`` on every ``withdrawRequest``, and an
+#: output named by a bearer ``h`` taken certified or not.
 DEFAULT_POLICY = Policy()
 
 
@@ -112,24 +111,24 @@ class WithdrawRequestInfo:
     max_withdrawable: int
     min_withdrawable: int = 0
     default_description: str | None = None
-    #: The key a ``cp1`` note's certificate verifies against, and a legacy
-    #: Part 1 signature too. Only ever None when the caller passed a Policy
-    #: with ``require_mint_pubkey`` false.
+    #: The key every certificate from this SERVICE verifies against. Only
+    #: ever None when the caller passed a Policy with ``require_mint_pubkey``
+    #: false.
     mint_pubkey: str | None = None
-    #: the response's ``sig``: for a Part 2 note, the SERVICE's ready-made
-    #: cs1 certificate for its current amount, so a holder need not force a
-    #: rotate just to get one. Passed on as sent and never checked here -
+    #: the response's ``c``: the SERVICE's cs1 certificate over the note's
+    #: ``hex(Q)`` and current amount, so a holder need not force a rotate just
+    #: to get one. Passed on as sent and never checked here -
     #: :func:`~lnurlcash_kit.signature.verify_note_signature` is the check.
-    #: None when the SERVICE sent none, which is normal for a Part 1 note
+    #: None when the SERVICE sent none, as a mint with no signer does
     signature: str | None = None
 
 
 @dataclass(frozen=True)
 class NoteInfoByHash:
-    """What a hash lookup returns.
+    """What a lookup by ``p`` returns.
 
     Deliberately NOT :class:`WithdrawRequestInfo`: that type's ``k1`` is the
-    bearer secret, and the whole point of asking by hash is that the caller
+    spend, and the whole point of asking by a public name is that the caller
     already holds it and the SERVICE never sends it back. A conforming SERVICE
     omits ``k1`` here (LUD-03's convenience of echoing the queried value has
     nothing to echo), so a type promising one would be promising something no
@@ -141,8 +140,8 @@ class NoteInfoByHash:
     min_withdrawable: int = 0
     default_description: str | None = None
     mint_pubkey: str | None = None
-    #: as on :class:`WithdrawRequestInfo`: a Part 2 note's cs1, which is what
-    #: makes a lookup by cp1 enough to rebuild a verifiable note on restore
+    #: as on :class:`WithdrawRequestInfo`: the note's cs1, which is what makes
+    #: a lookup by cp1 enough to rebuild a verifiable note on restore
     signature: str | None = None
 
 
@@ -199,7 +198,7 @@ class PayRequestInfo:
     #: read as fee-free rather than as unknown.
     mint_fee: MintFee | None = None
     #: LUD-12's field, and LUD-25's minting capability. A mint MUST allow the
-    #: 64 characters a hex-encoded SHA-256 commitment needs.
+    #: 64 characters a bearer note's hex ``h`` needs; a cp1 is 61.
     comment_allowed: int | None = None
     #: Additive ForgeSworn extension: this SERVICE also accepts the same
     #: commitment as an ``h`` parameter. Never a substitute for the mandatory
@@ -219,7 +218,8 @@ class PayRequestInfo:
         )
 
 
-#: The exact comment capacity minting needs: 32 bytes as lowercase hex.
+#: The comment capacity minting needs: a bearer note's ``h``, 32 bytes as
+#: lowercase hex. A cp1 is 61 characters, so it fits the same.
 MINT_COMMENT_LENGTH = 64
 
 
@@ -338,11 +338,19 @@ def _optional_iso_date(value: Any) -> str | None:
     return value if parsed.isoformat() == value else None
 
 
+def _certificate_field(body: dict, name: str, legacy: str) -> Any:
+    """A certificate as LUD-25 names it (``c``, ``c2``). ``legacy`` (``sig``,
+    ``sig2``) is what earlier drafts and mints called it, and is still READ
+    when the current name is absent; nothing here sends it."""
+    value = body.get(name)
+    return value if value is not None else body.get(legacy)
+
+
 def _optional_signature(body: dict) -> str | None:
-    """An informational GET's ``sig``, or nothing. Display and verification
-    material only, so a SERVICE sending something that is not a string gets
-    it dropped rather than the whole response refused."""
-    value = body.get("sig")
+    """An informational GET's ``c`` (or legacy ``sig``), or nothing. Display
+    and verification material only, so a SERVICE sending something that is not
+    a string gets it dropped rather than the whole response refused."""
+    value = _certificate_field(body, "c", "sig")
     return value if isinstance(value, str) and value else None
 
 
@@ -358,29 +366,36 @@ def _reject_error(body: Any) -> None:
 # ---- the informational GET ----
 
 
-def _same_note(a: str, b: str) -> bool:
-    """Whether two k1s name one note.
+def _same_note(a: str, b: str, note_url: str) -> bool:
+    """Whether two k1s name one note at the mint ``note_url`` is on.
 
-    Exact spelling is preferred; valid ck1 values may also be compared by
-    their verified embedded note key, so a legacy and a current ck1 for one
-    key name the same note. Anything that is not a note at all still has to
-    match as text, as it always did.
+    Exact spelling is preferred. A different spelling is the same note only
+    when both open the same ``Q`` there: one note may have several valid
+    spends (a short form and its cw1, another leaf, an older ck1), but a ck1
+    that does not verify for this mint names nothing a wallet should hold.
+    Anything that is no spend at all still has to match as text, as it
+    always did.
     """
     if a.strip().lower() == b.strip().lower():
         return True
-    id_a, id_b = note_id_of(a), note_id_of(b)
-    return id_a is not None and id_a == id_b
+    spend_a = verify_spend(a.strip().lower(), note_url)
+    spend_b = verify_spend(b.strip().lower(), note_url)
+    return (
+        spend_a is not None
+        and spend_b is not None
+        and spend_a.output_key == spend_b.output_key
+    )
 
 
 def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
     """LUD-03 step one. Never burns, rotates or alters the note.
 
-    ``sig`` is stripped before the request: it is only meaningful to a holder
-    inspecting the note locally, since the SERVICE already knows what it
+    The certificate (``c``, or legacy ``sig``) is stripped before the request:
+    it is only meaningful to a holder inspecting the note locally, since the SERVICE already knows what it
     signed. ``k1`` and ``amount`` are left as they are.
     """
     parts = urlparse(url)
-    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "sig"]
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in ("c", "sig")]
     request_url = urlunparse(parts._replace(query=urlencode(query)))
     queried = note_k1(url)
 
@@ -396,12 +411,12 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
         if not isinstance(callback, str) or not isinstance(k1, str):
             raise ProtocolError("Not a withdrawRequest (unexpected response).")
         maximum, minimum = _withdraw_amounts(body)
-        # Spec MUST: the response's k1 is the bearer secret itself, never a
+        # Spec MUST: the response's k1 is the echoed spend itself, never a
         # derived or opaque id. A SERVICE returning something else for the k1
         # it was queried with is non-compliant - or the note was rotated by
         # somebody else, which matters more. "Something else" means another
         # note, not another spelling of this one: see _same_note.
-        if queried and not _same_note(k1, queried):
+        if queried and not _same_note(k1, queried, url):
             raise ProtocolError(
                 "The service echoed back a different k1 than was queried - the "
                 "note may have been redeemed elsewhere, or the service isn't "
@@ -438,21 +453,22 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
 def note_info_by_hash_request(
     withdraw_link: str, h: str, policy: Policy = DEFAULT_POLICY
 ) -> Request:
-    """The informational GET for a note named by its hash, so nothing
-    spendable goes on the wire (LUD-25, "Checking a note without exposing it").
+    """The informational GET for a note named by its public name, a ``cp1``
+    or a bearer note's hex ``h``, so nothing spendable goes on the wire
+    (LUD-25, "Checking a note without exposing it").
 
     What a restore walk uses: a walk queries a whole gap window of indices the
     wallet has not minted into yet, and asking by secret would publish exactly
     the secrets it is about to mint under.
 
-    A rejection means nothing on its own. A SERVICE that does not index by hash
-    must answer as it would for an unknown ``k1``, and so must one answering
-    for a note that was burned, so only a positive answer is evidence.
+    A rejection means nothing on its own. An unknown note is answered as an
+    unknown ``k1`` is, and so is a note that was burned, so only a positive
+    answer is evidence.
 
-    ``h`` may be a Part 2 cp1 instead, sent as ``p``: see
+    Either spelling goes as ``p``: see
     :func:`~lnurlcash_kit.note.build_note_info_url_by_hash`, and
     :func:`~lnurlcash_kit.recoverable.note_lookup_of` for the right value to
-    pass for either kind of note.
+    pass for any note.
 
     Differs from :func:`note_info_request` in exactly two places, both because
     there was no secret in the request: ``k1`` is not required in the response,
@@ -536,9 +552,10 @@ def mint_address_request(url: str) -> Request:
 
 # ---- the mutating callback ----
 #
-# Every ``k1`` here may be a Part 1 secret or a Part 2 ck1. The SERVICE tells
-# them apart by shape, so both pass through untouched, and one merge may mix
-# the two kinds. Every output may be a hash or a cp1: see _output_param.
+# Every ``k1`` here may be any spend: a ck1, a cw1, or a bearer preimage. The
+# SERVICE tells them apart by shape, so all pass through untouched, and one
+# merge may mix them. Every output may be a bearer ``h`` or a cp1: see
+# _output_param.
 
 
 def _parse_success(body: Any) -> dict:
@@ -558,11 +575,8 @@ def _parse_success(body: Any) -> dict:
 
 
 def _names_cp1(output: str) -> bool:
-    """Whether an output goes on the wire as a Part 2 key rather than a hash.
-
-    One predicate for both halves of the rule, so what is sent as ``p1`` or
-    ``p2`` and what is owed a certificate cannot drift apart.
-    """
+    """Whether an output was named by a ``cp1`` rather than a bearer ``h``,
+    which is what decides the certificate it is owed."""
     return is_cp1(output.strip().lower())
 
 
@@ -571,14 +585,13 @@ def _require_signature(
 ) -> str | None:
     """What a mutation owes for each note it mints, by the kind of note.
 
-    ``output`` is the ``h``/``p1`` (or ``h2``/``p2``) the mutation named. A
-    ``cp1`` output is owed its ``cs1`` certificate: LUD-25 Part 2 requires one,
-    and it is the whole reason to hold a ``cp1`` note, so no policy waives it.
-    A legacy hash output carries the raw Part 1 signature when available, and
-    is refused without it only when ``require_signatures`` enables strict
-    reference-wallet parity. A signature that is present is passed on as sent,
-    never checked here: :func:`~lnurlcash_kit.signature.verify_note_signature`
-    is the check.
+    ``output`` is the ``p1`` (or ``p2``) the mutation named. An output named
+    by ``cp1`` is owed its ``cs1``: offline verification is the whole reason
+    to name a note that way, so no policy waives it. One named by a bearer
+    ``h`` is refused without a certificate only when ``require_signatures``
+    asks. A certificate that is present is passed on as sent, never checked
+    here: :func:`~lnurlcash_kit.signature.verify_note_signature` is the
+    check.
 
     The mutation has already landed by the time this is called - ``status`` was
     OK - so the exception has to carry the caller's secrets out with it, or
@@ -592,13 +605,13 @@ def _require_signature(
     if _names_cp1(output):
         raise UnverifiableNote(
             f"The service confirmed the {what} to a cp1 output but returned no "
-            "cs1 certificate, which LUD-25 Part 2 requires, so the note it just "
-            "minted cannot be verified offline. The note exists - keep the key."
+            "cs1 certificate, so the note it just minted cannot be verified "
+            "offline. The note exists - keep the key."
         )
     if not policy.require_signatures:
         return None
     raise UnverifiableNote(
-        f"The service confirmed the {what} but returned no signature, so the "
+        f"The service confirmed the {what} but returned no certificate, so the "
         "note it just minted cannot be verified offline. The note exists - "
         "keep the secret."
     )
@@ -641,35 +654,32 @@ def melt_request(callback: str, k1: str, pr: str) -> Request:
 
 
 def _output_param(value: str, which: int) -> tuple[str, str]:
-    """An output is a hash, or a Part 2 cp1 key.
-
-    LUD-25 renamed the callback's ``h``/``h2`` to ``p1``/``p2``. A hash keeps
-    the old names, which every mint accepts, and a key goes as ``p1``/``p2``,
-    which only a Part 2 mint takes anyway. Decided per value, never by a
-    version flag, which is lnurl-wallet's rule. The value itself goes out as
-    given, so a retry is byte-identical to the request it repeats.
+    """An output goes as ``p1``, or ``p2`` for a split's change, as LUD-25
+    spells them, whether it is a cp1 or a bearer note's hex ``h`` (its cp1
+    short form). Mints from before the rename also read ``h`` and ``h2``, but
+    every current one reads ``p1`` and ``p2`` for both. The value itself goes
+    out as given, so a retry is byte-identical to the request it repeats.
     """
-    if _names_cp1(value):
-        return (f"p{which}", value)
-    return ("h" if which == 1 else "h2", value)
+    return (f"p{which}", value)
 
 
 def rotate_request_with_hash(
     callback: str, k1: str, h: str, policy: Policy = DEFAULT_POLICY
 ) -> Request:
-    """Rotate ``k1`` into an output the caller names: a hash, or a ``cp1``.
+    """Rotate ``k1`` into an output the caller names: a bearer note's hex
+    ``h``, or a ``cp1``.
 
-    A ``cp1`` output that comes back without its ``cs1`` raises
+    An output named by ``cp1`` that comes back without its ``cs1`` raises
     :class:`~lnurlcash_kit.errors.UnverifiableNote` whatever the policy says.
-    A legacy hash output returns ``signature`` None only in no-signer mode,
-    unless the policy's ``require_signatures`` demands the raw Part 1 proof.
+    One named by a bearer ``h`` returns ``signature`` None from a mint with
+    no signer, unless the policy's ``require_signatures`` demands one.
     """
     url = _callback(callback, [("k1", k1), _output_param(h, 1)])
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "rotate", h)
+            signature=_require_signature(_certificate_field(ok, "c", "sig"), policy, "rotate", h)
         )
 
     return Request(url=url, parse=parse, replayable=True)
@@ -684,9 +694,9 @@ def split_request_with_hash(
     policy: Policy = DEFAULT_POLICY,
 ) -> Request:
     """Split into ``amount_msat`` at ``h`` and the change at ``h2``, each a
-    hash or a ``cp1``. Each output is owed what its kind is owed, exactly as
-    in :func:`rotate_request_with_hash`: a ``cp1`` change without ``sig2``
-    raises, a hash change without one is a plain note."""
+    bearer ``h`` or a ``cp1``. Each output is owed what its naming is owed,
+    exactly as in :func:`rotate_request_with_hash`: a ``cp1`` change without
+    ``c2`` raises, a bearer change without one is taken as it is."""
     url = _callback(
         callback,
         [("k1", k1) for k1 in k1s]
@@ -699,9 +709,9 @@ def split_request_with_hash(
         # is owed: a cp1 change is no lesser note than a cp1 first output.
         # Checked in output order so the message names the one missing.
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "split", h),
+            signature=_require_signature(_certificate_field(ok, "c", "sig"), policy, "split", h),
             change_signature=_require_signature(
-                ok.get("sig2"), policy, "split's change", h2
+                _certificate_field(ok, "c2", "sig2"), policy, "split's change", h2
             ),
         )
 
@@ -716,7 +726,7 @@ def merge_request_with_hash(
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "merge", h)
+            signature=_require_signature(_certificate_field(ok, "c", "sig"), policy, "merge", h)
         )
 
     return Request(url=url, parse=parse, replayable=True)
@@ -724,14 +734,14 @@ def merge_request_with_hash(
 
 # ---- the generating variants ----
 #
-# Per LUD-25 the WALLET generates the replacement secret and discloses only
-# its hash. The SERVICE never sees, generates or persists it, which is what
-# closes the prior-holder exposure a SERVICE-generated replacement would
-# otherwise reopen on every single rotate.
+# Per LUD-25 the WALLET generates every resulting note itself and discloses
+# only its public name: here a bearer note, whose preimage is drawn fresh and
+# whose h goes out as p1 or p2. The SERVICE never sees, generates or persists
+# the preimage, which is what closes the prior-holder exposure a
+# SERVICE-generated replacement would otherwise reopen on every single rotate.
 #
-# Every output here is a plain hash note, so against a SERVICE following Part
-# 2 its signature comes back None. A note someone else can verify offline is
-# a cp1 note: name one through the *_with_hash calls.
+# The SERVICE certifies these bearer notes over hex(Q) when it has a signer;
+# a key-path note is minted through the *_with_hash calls, naming its cp1.
 
 
 def rotate_request(
@@ -874,22 +884,24 @@ def invoice_request(pay_callback: str, amount_msat: int) -> Request:
 def mint_invoice_request_with_hash(
     pay_callback: str, amount_msat: int, h: str
 ) -> Request:
-    """Ask for a mint invoice, naming the note it will credit.
+    """Ask for a mint invoice, naming the note it will credit: a bearer
+    note's ``h = sha256(preimage)`` for a preimage only the WALLET holds, or a
+    ``cp1``.
 
-    ``h`` is ``sha256(secret)`` for a secret only the WALLET holds. LUD-25
-    carries it as a mandatory LUD-12 ``comment``; ``h`` repeats the identical
-    value for SERVICEs that took the parameter form first. It is never an
-    alternative to the comment.
+    LUD-25 carries the name as a mandatory LUD-12 ``comment``; for a hex
+    ``h``, the ``h`` parameter repeats the identical value for SERVICEs that
+    took the parameter form first. It is never an alternative to the comment.
 
-    The SERVICE learns a hash and nothing else, so the payment preimage is
-    settlement proof only - it can never redeem the note. That is the whole
-    point of the current draft: a preimage propagates to every routing node
-    that forwards the payment, and a note keyed by one is a note they can all
+    The SERVICE learns a public name and nothing else, so the payment
+    preimage is settlement proof only - it can never redeem the note. That is
+    the whole point: a payment preimage propagates to every routing node that
+    forwards the payment, and a note keyed by one is a note they can all
     spend.
 
-    ``h`` may instead be a Part 2 cp1, minting a note keyed by that public
-    key. It goes as the comment alone: ``h`` is a hash-only extension, and a
-    mint may refuse a key under it.
+    A ``cp1`` goes as the comment alone: the ``h`` parameter is a hash-only
+    extension, and a mint may refuse a key under it. One whose key is not a
+    curve point is refused here, before anything is paid into a note nobody
+    could ever spend.
     """
     # lowercase for the same reason a note's k1 is normalised: it is bytes,
     # not text, and a SERVICE storing notes under what it was given should be
@@ -903,8 +915,8 @@ def mint_invoice_request_with_hash(
         # Refused here rather than sent, so a WALLET never pays for a quote
         # the SERVICE was always going to reject.
         raise RequestRefused(
-            "An output must be 32 bytes of hex or a cp1 key "
-            "- no invoice was requested."
+            "An output must be a bearer note's 32-byte hex h or a cp1 naming a "
+            "curve point - no invoice was requested."
         )
     # The response shape is an ordinary LUD-06 invoice; reuse its parser
     # rather than restating it.

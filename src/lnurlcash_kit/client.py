@@ -66,9 +66,9 @@ class _Base:
         #: for what a caller takes on by doing so.
         self.rng = rng
         #: What this client insists a SERVICE does. The default demands a cs1
-        #: on every cp1 output and a mintPubkey on every withdrawRequest. It
-        #: verifies a raw Part 1 signature when present, while tolerating its
-        #: omission by a no-signer legacy mint. See
+        #: on every output named by cp1 and a mintPubkey on every
+        #: withdrawRequest, while tolerating an uncertified output named by a
+        #: bearer h from a mint with no signer. See
         #: :class:`~lnurlcash_kit.protocol.Policy`.
         self.policy = policy
         #: How many times to re-send a rotate, split or merge whose outcome the
@@ -119,8 +119,8 @@ class _Base:
         guarantee at all.
 
         The same Request goes out each time rather than a rebuilt one: the
-        replay is matched on the k1 set, h, h2 and amount, so a regenerated
-        secret would make the retry a DIFFERENT mutation.
+        replay is matched on the notes the k1s open, p1, p2 and amount, so a
+        regenerated secret would make the retry a DIFFERENT mutation.
         """
         return self.mutation_retries if request.replayable else 0
 

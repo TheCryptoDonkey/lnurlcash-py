@@ -1,10 +1,10 @@
-"""bech32, as LUD-01 uses it, and bech32m, as LUD-25 Part 2 does.
+"""bech32, as LUD-01 uses it, and bech32m, as LUD-25's own values do.
 
 The reference implementation from BIP-173, by Pieter Wuille, vendored rather
 than pulled in as a dependency: it is sixty lines of checksum arithmetic with
 no crypto in it, and a bearer-money library is better off with one fewer
 supply-chain edge. LNURL raises the length limit well above bech32's default,
-because a note URL carrying k1, amount and sig is long.
+because a note URL carrying k1, amount and certificate is long.
 
 bech32m (BIP-350) differs from bech32 in one constant, the value the checksum
 is XORed with, so it is the same code with that constant passed in. The two
@@ -18,7 +18,7 @@ CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 #: BIP-173's checksum constant: plain bech32, which LUD-01 uses.
 BECH32 = 1
-#: BIP-350's: bech32m, which LUD-25 Part 2's cp1, ck1, cs1 and cx1 use.
+#: BIP-350's: bech32m, which LUD-25's cp1, ck1, cw1, cs1 and cx1 use.
 BECH32M = 0x2BC830A3
 
 
