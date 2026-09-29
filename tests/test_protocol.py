@@ -20,14 +20,22 @@ from lnurlcash_kit import (
     NotePending,
     NoteSpent,
     NoteUnknown,
+    Certification,
+    OutputInUse,
     Policy,
     ProtocolError,
     RequestRefused,
     ServiceRejected,
     UnverifiableNote,
+    bearer_cw1,
+    bearer_note_id,
     build_note_url,
+    encode_ck1,
+    encode_cp1,
     hash_k1,
     new_secrets_of,
+    resolve_note_input,
+    sign_note_ownership,
     verify_note_signature,
 )
 from lnurlcash_kit.protocol import (
@@ -195,8 +203,8 @@ def test_rotate_burns_the_old_secret_and_mints_one_the_service_never_saw(mint, c
 
 
 def test_rotate_signature_verifies_offline(mint, client):
-    # The reference mint's raw Part 1 signature over a legacy note is kept:
-    # the default neither demands it nor drops it.
+    # the mint certifies the bearer note it minted over hex(Q), and the
+    # default neither demands the certificate nor drops it
     m = mint()
     k1 = secret()
     m.credit(k1, 21000)
@@ -204,8 +212,11 @@ def test_rotate_signature_verifies_offline(mint, client):
     rotated = client.rotate_note(info.callback, k1)
 
     assert rotated.signature
-    assert verify_note_signature(rotated.k1, 21000, rotated.signature, m.pubkey)
-    assert not verify_note_signature(rotated.k1, 21001, rotated.signature, m.pubkey)
+    assert (
+        verify_note_signature(rotated.k1, m.url, 21000, rotated.signature, m.pubkey)
+        is Certification.CERTIFIED_OVER_Q
+    )
+    assert not verify_note_signature(rotated.k1, m.url, 21001, rotated.signature, m.pubkey)
 
 
 def test_accepts_the_other_recovery_id_layout(mint, client):
@@ -214,7 +225,10 @@ def test_accepts_the_other_recovery_id_layout(mint, client):
     m.credit(k1, 21000)
     info = client.fetch_note_info(m.note_url(k1))
     rotated = client.rotate_note(info.callback, k1)
-    assert verify_note_signature(rotated.k1, 21000, rotated.signature, m.pubkey)
+    assert (
+        verify_note_signature(rotated.k1, m.url, 21000, rotated.signature, m.pubkey)
+        is Certification.CERTIFIED_OVER_Q
+    )
 
 
 def test_a_no_signer_legacy_mint_is_tolerated_by_default(mint, client):
@@ -299,8 +313,10 @@ def test_split_produces_an_amount_and_its_change(mint, client):
     assert m.note_state(k1) == "burned"
     assert client.fetch_note_info(m.note_url(result.k1)).max_withdrawable == 5000
     assert client.fetch_note_info(m.note_url(result.change)).max_withdrawable == 16000
-    assert verify_note_signature(result.k1, 5000, result.signature, m.pubkey)
-    assert verify_note_signature(result.change, 16000, result.change_signature, m.pubkey)
+    assert verify_note_signature(result.k1, m.url, 5000, result.signature, m.pubkey)
+    assert verify_note_signature(
+        result.change, m.url, 16000, result.change_signature, m.pubkey
+    )
 
 
 def test_split_takes_several_notes_at_once(mint, client):
@@ -665,8 +681,12 @@ def test_a_lying_service_cannot_inflate_past_what_it_signed(mint, client):
     assert info.max_withdrawable == 1_021_000
     # the signature was issued over the true amount, so the inflated one does
     # not verify - an offline holder catches this without asking anyone
-    assert not verify_note_signature(k1, info.max_withdrawable, signature, m.pubkey)
-    assert verify_note_signature(k1, 21000, signature, m.pubkey)
+    assert not verify_note_signature(k1, m.url, info.max_withdrawable, signature, m.pubkey)
+    assert verify_note_signature(k1, m.url, 21000, signature, m.pubkey)
+    # and the certificate the lookup hands out says the same
+    assert not verify_note_signature(
+        k1, m.url, info.max_withdrawable, info.signature, m.pubkey
+    )
 
 
 def test_settle_surfaces_a_rotate_that_may_have_applied(mint):
@@ -755,3 +775,128 @@ def test_what_a_mint_says_it_owes_keeps_zero_distinct_from_silence():
     assert _mint_address(outstandingNotesMsat=0).outstanding_notes_msat == 0
     assert _mint_address().outstanding_notes_msat is None
     assert _mint_address(outstandingNotesMsat="48000").outstanding_notes_msat is None
+
+
+# ---- notes keyed by Q, at the mock mint ----
+#
+# The mock mint keys every note by hex(Q), verifies every spend in full (a ck1
+# against the hostname it was reached at, 127.0.0.1 here), and certifies every
+# note with a cs1 over hex(Q).
+
+
+def _lookup(m, name: str):
+    """The informational GET by a note's public name, through the no-I/O
+    request and its parser, as a caller with its own HTTP stack makes it."""
+    request = note_info_by_hash_request(f"{m.url}/w", name)
+    return request.parse(httpx.get(request.url).json())
+
+
+def _test_key(label: str, m) -> tuple[bytes, str, str]:
+    """A note key made for these tests alone, with its cp1 and the ck1 that
+    spends it at ``m``."""
+    import hashlib
+
+    key = hashlib.sha256(f"lnurlcash-py test key {label}".encode()).digest()
+    payload = sign_note_ownership(key, m.url)
+    return key, encode_cp1(payload[:32]), encode_ck1(payload)
+
+
+def test_a_key_path_note_round_trips_at_the_mint(mint, client):
+    m = mint()
+    _, cp1, ck1 = _test_key("a", m)
+    m.credit(ck1, 21000)
+
+    # the lookup verifies the spend, echoes it, and hands out the certificate
+    info = client.fetch_note_info(m.note_url(ck1))
+    assert info.k1 == ck1 and info.max_withdrawable == 21000
+    assert (
+        verify_note_signature(ck1, m.url, 21000, info.signature, m.pubkey)
+        is Certification.CERTIFIED_OVER_Q
+    )
+    # looked up by its cp1, the spend never leaves this process
+    by_key = _lookup(m, cp1)
+    assert by_key.max_withdrawable == 21000 and by_key.signature == info.signature
+
+    # rotate into another key; the output comes back certified
+    _, cp1_b, ck1_b = _test_key("b", m)
+    result = client.rotate_note_with_hash(info.callback, ck1, cp1_b)
+    assert m.note_state(ck1) == "burned"
+    assert (
+        verify_note_signature(ck1_b, m.url, 21000, result.signature, m.pubkey)
+        is Certification.CERTIFIED_OVER_Q
+    )
+
+    # and back out to a bearer note this client draws
+    rotated = client.rotate_note(info.callback, ck1_b)
+    assert (
+        verify_note_signature(rotated.k1, m.url, 21000, rotated.signature, m.pubkey)
+        is Certification.CERTIFIED_OVER_Q
+    )
+
+
+def test_a_ck1_for_another_mint_opens_nothing(mint, client):
+    m = mint()
+    key, _, ck1 = _test_key("c", m)
+    m.credit(ck1, 21000)
+    foreign = encode_ck1(sign_note_ownership(key, "elsewhere.example"))
+
+    with pytest.raises(NoteUnknown):
+        client.fetch_note_info(m.note_url(foreign))
+    with pytest.raises(ServiceRejected):
+        client.rotate_note(f"{m.url}/w/cb", foreign)
+    assert m.note_state(ck1) == "outstanding"
+    # and this library would not have let it through the door either
+    assert resolve_note_input(m.note_url(foreign)) is None
+
+
+def test_a_bearer_note_spends_by_its_full_cw1(mint, client):
+    m = mint()
+    preimage = secret()
+    m.credit(preimage, 21000)
+    cw1 = bearer_cw1(preimage)
+    info = client.fetch_note_info(m.note_url(cw1))
+    assert info.max_withdrawable == 21000
+    # the certificate names the note, not the spelling of its spend
+    for spend in (preimage, cw1):
+        assert (
+            verify_note_signature(spend, m.url, 21000, info.signature, m.pubkey)
+            is Certification.CERTIFIED_OVER_Q
+        )
+    # looked up by its h, the short form of its cp1
+    assert _lookup(m, hash_k1(preimage)).max_withdrawable == 21000
+    rotated = client.rotate_note(info.callback, cw1)
+    assert m.note_state(preimage) == "burned"
+    assert m.note_state(rotated.k1) == "outstanding"
+
+
+def test_an_output_already_in_use_is_refused_and_burns_nothing(mint, client):
+    m = mint()
+    source, taken = secret(), secret()
+    m.credit(source, 21000)
+    m.credit(taken, 1000)
+    callback = f"{m.url}/w/cb"
+
+    with pytest.raises(OutputInUse) as raised:
+        client.rotate_note_with_hash(callback, source, hash_k1(taken))
+    assert not isinstance(raised.value, (NoteSpent, NoteUnknown))
+    assert new_secrets_of(raised.value) == []
+    assert m.note_state(source) == "outstanding"
+    # the same output named by its cp1 is the same note, and just as taken
+    taken_cp1 = encode_cp1(bytes.fromhex(bearer_note_id(hash_k1(taken))))
+    with pytest.raises(OutputInUse):
+        client.rotate_note_with_hash(callback, source, taken_cp1)
+
+
+def test_lnurl_mints_wording_of_already_in_use():
+    # lnurl-mint says "Output already in use." rather than the spec's exact
+    # "already in use"; a wallet retrying at its next index must see both
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"status": "ERROR", "reason": "Output already in use."}
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        with pytest.raises(OutputInUse):
+            LnurlcashClient(client=http).rotate_note_with_hash(
+                "https://mint.example/w/cb", secret(), hash_k1(secret())
+            )

@@ -8,9 +8,9 @@ What each class means for the money involved:
     AmbiguousMint     the outcome is unknown. The request MAY have been
                       processed. Nothing may be assumed either way.
     ProtocolError     a non-mutating response did not match the spec.
-    UnverifiableNote  a MUTATION landed and the SERVICE withheld a signature
-                      it owed: a cp1 output's certificate, or a hash output's
-                      Part 1 signature when the policy asks for one. The note
+    UnverifiableNote  a MUTATION landed and the SERVICE withheld a certificate
+                      it owed: always for an output named by cp1, and for one
+                      named by a bearer h when the policy asks. The note
                       exists; it just cannot be verified offline.
 
 Treating an ambiguous failure as a definitive one is how wallets lose money:
@@ -83,6 +83,21 @@ class NoteUnknown(ServiceRejected):
         )
 
 
+class OutputInUse(ServiceRejected):
+    """LUD-25's {"status":"ERROR","reason":"already in use"}: an output
+    the request named, ``p1`` or ``p2``, is already outstanding or was burned
+    before, so the SERVICE refused rather than credit value into a note
+    somebody else may hold the spend for. Nothing was burned. Name a fresh
+    output - the next index, for a key derived from a branch - and try
+    again."""
+
+    def __init__(self, reason: str = "already in use") -> None:
+        super().__init__(reason)
+        self.args = (
+            "An output this request named is already in use - name a fresh one.",
+        )
+
+
 class AmbiguousMint(LnurlcashError):
     """The outcome is unknown. The failure happened in a window where the
     request may already have reached and been processed by the SERVICE: a
@@ -92,13 +107,15 @@ class AmbiguousMint(LnurlcashError):
 
 class UnverifiableNote(LnurlcashError):
     """The SERVICE confirmed a rotate, split or merge with {"status":"OK"}
-    but withheld a signature the note it minted was owed.
+    but withheld a certificate the note it minted was owed.
 
-    Raised for a ``cp1`` output that came back without its ``cs1``
-    certificate, which LUD-25 Part 2 requires whatever the policy says - a
-    non-compliant SERVICE. And for a hash output that came back unsigned when
-    the policy's ``require_signatures`` asked for the raw Part 1 signature.
-    The tolerant default instead admits the reference mint's no-signer mode.
+    Raised for an output named by ``cp1`` that came back without its ``cs1``,
+    whatever the policy says: LUD-25 says a SERVICE SHOULD certify every
+    note, and this library insists for a ``cp1``, since offline verification
+    is the reason to name a note that way. And for an output named by a
+    bearer note's hex ``h`` that came back uncertified when the policy's
+    ``require_signatures`` asked. The tolerant default instead admits a mint
+    with no signer.
 
     Either way the mutation LANDED. The note exists, at the key or hash the
     caller disclosed, and the secret behind it is the only key to that value
@@ -169,6 +186,10 @@ def classify_note_error(reason: str) -> ServiceRejected:
     the rule for an unknown note, and reports one on no evidence at all.
     """
     lowered = reason.lower()
+    # LUD-25 says exactly "already in use"; lnurl-mint says "Output already
+    # in use.", so it is matched as a phrase, as lnurl-wallet does
+    if "already in use" in lowered:
+        return OutputInUse(reason)
     if "spent" in lowered:
         return NoteSpent(reason)
     if "unknown" in lowered or "not found" in lowered:

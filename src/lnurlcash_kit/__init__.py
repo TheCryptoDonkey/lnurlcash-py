@@ -3,15 +3,16 @@
 A bearer note is an ordinary LUD-03 withdrawRequest link whose k1 IS the
 asset::
 
-    lnurlw://mint.example/w?k1=<secret>&amount=<msat>
+    lnurlw://mint.example/w?k1=<spend>&amount=<msat>
 
 Whoever knows the k1 controls the sats behind it, like a banknote. The
 ``amount`` alongside it is only a claim by whoever encoded the note; the
 authoritative value is always ``maxWithdrawable`` from an informational GET.
 
-A LUD-25 Part 2 note is the same link keyed by a public key instead: its k1 is
-a ``ck1``, that key and a BIP-340 Schnorr proof the mint verifies. See
-:mod:`lnurlcash_kit.recoverable`.
+Every note is a BIP-341 taproot output key ``Q``, named ``cp1<Q>``, and the
+k1 is a spend of it: a bearer note's 64-hex preimage, a ``ck1`` signed by
+``Q`` for one mint, or a ``cw1`` opening a leaf of ``Q``'s script tree. See
+:mod:`lnurlcash_kit.spend` and :mod:`lnurlcash_kit.recoverable`.
 
 Draft spec: https://github.com/lnurl/luds/pull/301
 
@@ -31,6 +32,7 @@ from .errors import (
     NotePending,
     NoteSpent,
     NoteUnknown,
+    OutputInUse,
     ProtocolError,
     RequestRefused,
     ServiceRejected,
@@ -86,6 +88,10 @@ from .recoverable import (
     NOSTR_CASH_SEED_LABEL,
     Cs1,
     Cx1,
+    NoteOwnership,
+    Spend,
+    SpendKind,
+    VerifiedSpend,
     cash_node_to_cx1,
     decode_any_cs1,
     decode_ck1,
@@ -93,6 +99,7 @@ from .recoverable import (
     decode_cs1,
     decode_cs1_with_amount,
     decode_cx1,
+    decode_spend,
     derive_cash_address_node,
     derive_note_pubkey,
     derive_note_secret_key,
@@ -111,9 +118,9 @@ from .recoverable import (
     is_cx1,
     note_id_of,
     note_lookup_of,
-    note_ownership_message,
     recover_note_ownership_pubkey,
     sign_note_ownership,
+    verify_spend,
 )
 from .secrets import (
     derive_note_root,
@@ -123,6 +130,7 @@ from .secrets import (
     is_preimage,
 )
 from .signature import (
+    Certification,
     address_proof_digest,
     address_proof_message,
     note_signature_digest,
@@ -131,7 +139,36 @@ from .signature import (
     note_signature_message_for_hash,
     sign_address_proof,
     verify_note_signature,
+    verify_note_signature_for_key,
     verify_note_signature_hash,
+    verify_note_url,
+)
+from .spend import (
+    KEY_PATH_LOCKTIME,
+    KEY_PATH_SEQUENCE,
+    NUMS_KEY,
+    TAPLEAF_VERSION,
+    BearerNote,
+    Cw1,
+    bearer_cw1,
+    bearer_leaf,
+    bearer_note,
+    bearer_note_id,
+    check_leaf_policy,
+    check_time_claim,
+    decode_cw1,
+    encode_cw1,
+    is_cw1,
+    is_x_only_point,
+    key_path_sighash,
+    output_key_of,
+    output_key_of_cw1,
+    script_path_sighash,
+    spend_domain_of,
+    spend_prevout,
+    spend_sig_msg,
+    tap_leaf_hash,
+    taproot_tweak,
 )
 from .urls import (
     from_bech32_lnurl,
@@ -160,6 +197,7 @@ __all__ = [
     "NotePending",
     "NoteSpent",
     "NoteUnknown",
+    "OutputInUse",
     "Policy",
     "ProtocolError",
     "RequestRefused",
@@ -209,6 +247,10 @@ __all__ = [
     "NOSTR_CASH_SEED_LABEL",
     "Cs1",
     "Cx1",
+    "NoteOwnership",
+    "Spend",
+    "SpendKind",
+    "VerifiedSpend",
     "cash_node_to_cx1",
     "decode_any_cs1",
     "decode_ck1",
@@ -216,6 +258,7 @@ __all__ = [
     "decode_cs1",
     "decode_cs1_with_amount",
     "decode_cx1",
+    "decode_spend",
     "derive_cash_address_node",
     "derive_note_pubkey",
     "derive_note_secret_key",
@@ -234,9 +277,10 @@ __all__ = [
     "is_cx1",
     "note_id_of",
     "note_lookup_of",
-    "note_ownership_message",
     "recover_note_ownership_pubkey",
     "sign_note_ownership",
+    "verify_spend",
+    "Certification",
     "address_proof_digest",
     "address_proof_message",
     "note_signature_digest",
@@ -245,7 +289,34 @@ __all__ = [
     "note_signature_message_for_hash",
     "sign_address_proof",
     "verify_note_signature",
+    "verify_note_signature_for_key",
     "verify_note_signature_hash",
+    "verify_note_url",
+    "KEY_PATH_LOCKTIME",
+    "KEY_PATH_SEQUENCE",
+    "NUMS_KEY",
+    "TAPLEAF_VERSION",
+    "BearerNote",
+    "Cw1",
+    "bearer_cw1",
+    "bearer_leaf",
+    "bearer_note",
+    "bearer_note_id",
+    "check_leaf_policy",
+    "check_time_claim",
+    "decode_cw1",
+    "encode_cw1",
+    "is_cw1",
+    "is_x_only_point",
+    "key_path_sighash",
+    "output_key_of",
+    "output_key_of_cw1",
+    "script_path_sighash",
+    "spend_domain_of",
+    "spend_prevout",
+    "spend_sig_msg",
+    "tap_leaf_hash",
+    "taproot_tweak",
     "decode_bolt11_amount_msat",
     "is_bolt11_invoice",
     "same_invoice",

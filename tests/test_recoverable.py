@@ -1,11 +1,10 @@
-"""LUD-25 Part 2 on the wire, and the edges of its primitives that the
-conformance vectors do not reach.
+"""Key-path notes and spends on the wire, and the edges of their primitives
+that the conformance vectors do not reach.
 
-The mock mint speaks Part 1 only, so the wire half builds each request and
-reads its URL, which is exactly what the clients send: they GET
-``Request.url`` and nothing else. The note values are the conformance
-vectors', so every key, ck1 and cs1 here is one another implementation agrees
-on.
+The wire half builds each request and reads its URL, which is exactly what
+the clients send: they GET ``Request.url`` and nothing else. The note values
+are the conformance vectors', whose first branch is at mint.example, so every
+key, ck1 and cs1 here is one another implementation agrees on.
 """
 
 from __future__ import annotations
@@ -19,12 +18,15 @@ from coincurve import PrivateKey
 
 from conftest import load_vectors
 from lnurlcash_kit import (
+    Certification,
     Cs1,
     LnurlcashClient,
     Policy,
     ProtocolError,
     RequestRefused,
     UnverifiableNote,
+    bearer_cw1,
+    bearer_note_id,
     build_note_info_url_by_hash,
     cash_node_from_hex,
     decode_any_cs1,
@@ -47,6 +49,7 @@ from lnurlcash_kit import (
     is_ck1,
     is_cp1,
     is_cs1_with_amount,
+    is_cw1,
     is_cx1,
     new_secrets_of,
     note_id_of,
@@ -56,6 +59,7 @@ from lnurlcash_kit import (
     resolve_note_input,
     sign_note_ownership,
     verify_note_signature,
+    verify_spend,
 )
 from lnurlcash_kit import bech32, recoverable
 from lnurlcash_kit.protocol import (
@@ -69,6 +73,7 @@ from lnurlcash_kit.protocol import (
 )
 
 K1 = "11" * 32
+DOMAIN = "mint.example"
 CB = "https://mint.example/w/cb"
 PAY_CB = "https://mint.example/p/cb"
 _CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -107,6 +112,15 @@ def legacy_ck1(secret_key_hex: str) -> str:
     digest = sha256(sha256(b"Lightning Signed Message:LNURLcash").digest()).digest()
     signature = PrivateKey(bytes.fromhex(secret_key_hex)).sign_recoverable(digest, hasher=None)
     return bech32.encode("ck", signature, constant=bech32.BECH32M)
+
+
+def digest_message_ck1(secret_key: bytes) -> bytes:
+    """A 96-byte ck1 payload signed over ``sha256("LNURLcash")``, the form
+    current until spends moved onto the sighash, with all-zero auxiliary
+    input."""
+    signer = PrivateKey(secret_key)
+    digest = sha256(b"LNURLcash").digest()
+    return signer.public_key_xonly.format() + signer.sign_schnorr(digest, bytes(32))
 
 
 def raw_message_ck1(secret_key: bytes) -> bytes:
@@ -160,15 +174,21 @@ def raw_message_ck1(secret_key: bytes) -> bytes:
     return px + rx + ((k + e * d) % n).to_bytes(32, "big")
 
 
-# ---- a note's id, either kind ----
+# ---- a note's id, any kind ----
 
 
-def test_a_part1_secret_is_filed_and_looked_up_under_its_hash():
-    assert note_id_of(K1) == hash_k1(K1)
+def test_a_bearer_note_is_filed_under_its_q_and_looked_up_by_its_h():
+    # a preimage and its cw1 are one spend of one note, filed by hex(Q)
+    q = bearer_note_id(hash_k1(K1))
+    cw1 = bearer_cw1(K1)
+    for spend in (K1, K1.upper(), cw1):
+        assert note_id_of(spend) == q
+    # looked up by its short form, which every mint reads, or by its cp1
     assert note_lookup_of(K1) == hash_k1(K1)
+    assert note_lookup_of(cw1) == encode_cp1(bytes.fromhex(q))
 
 
-def test_a_part2_note_is_filed_under_its_key_and_looked_up_by_its_cp1(notes):
+def test_a_key_path_note_is_filed_under_its_key_and_looked_up_by_its_cp1(notes):
     a = notes[0]
     assert note_id_of(a["ck1"]) == a["notePubkey"]
     assert note_id_of(f"  {a['ck1'].upper()}  ") == a["notePubkey"]
@@ -184,12 +204,16 @@ def test_anything_else_has_no_id(notes, cert):
             assert note_lookup_of(bad) is None
 
 
-def test_one_key_reproduces_one_ck1(notes):
+def test_one_key_reproduces_one_ck1_per_mint(notes):
     # all-zero auxiliary input: a wallet restored from its seed re-signs every
-    # note it ever held to the same string
+    # note it ever held to the same string, for the same mint
     sk = bytes.fromhex(notes[0]["noteSecretKey"])
-    assert sign_note_ownership(sk) == sign_note_ownership(sk)
-    assert encode_ck1(sign_note_ownership(sk)) == notes[0]["ck1"]
+    first = sign_note_ownership(sk, DOMAIN)
+    assert first == sign_note_ownership(sk, "https://MINT.EXAMPLE:3338/w")
+    assert encode_ck1(first) == notes[0]["ck1"]
+    assert sign_note_ownership(sk, "elsewhere.example") != first
+    with pytest.raises(ProtocolError):
+        sign_note_ownership(sk, "")
 
 
 def test_a_legacy_ck1_stays_readable_for_rotation(notes):
@@ -202,17 +226,33 @@ def test_a_legacy_ck1_stays_readable_for_rotation(notes):
     # read, never written: the encoder only takes the current 96 bytes
     with pytest.raises(ProtocolError):
         encode_ck1(decode_ck1(legacy))
+    # it names no mint, so it reads the same at any, and says it is old
+    for domain in (DOMAIN, "elsewhere.example"):
+        verified = verify_spend(legacy, domain)
+        assert verified is not None and verified.legacy
+        assert verified.output_key.hex() == a["notePubkey"]
 
 
-def test_a_raw_message_ck1_stays_readable_for_rotation(notes):
-    # Pre-2026-09-16: signed over the raw 9-byte "LNURLcash" string rather
-    # than its sha256 digest - sign_note_ownership never produces this
-    # anymore, but a note minted under it must stay redeemable.
-    a = notes[0]
-    payload = raw_message_ck1(bytes.fromhex(a["noteSecretKey"]))
-    assert payload != sign_note_ownership(bytes.fromhex(a["noteSecretKey"]))
-    assert recover_note_ownership_pubkey(payload) == bytes.fromhex(a["notePubkey"])
+@pytest.mark.parametrize("make", [raw_message_ck1, digest_message_ck1], ids=["raw", "sha256"])
+def test_a_fixed_message_ck1_stays_readable_for_rotation(notes, make):
+    # Both were current once: over the raw 9-byte "LNURLcash" before
+    # 2026-09-16, then over its sha256 until spends moved onto the sighash.
+    # sign_note_ownership makes neither anymore, but a note carrying one must
+    # stay redeemable, and say it is old so a wallet rotates it.
+    a, b = notes[0], notes[1]
+    payload = make(bytes.fromhex(a["noteSecretKey"]))
+    assert payload != sign_note_ownership(bytes.fromhex(a["noteSecretKey"]), DOMAIN)
+    owner = recover_note_ownership_pubkey(payload, DOMAIN)
+    assert owner is not None and owner.legacy
+    assert owner.pubkey_x_only == bytes.fromhex(a["notePubkey"])
     assert note_id_of(encode_ck1(payload)) == a["notePubkey"]
+    # and its signature is not simply accepted for any message: moved onto
+    # another key, it verifies under no scheme
+    other = decode_ck1(b["ck1"])
+    assert recover_note_ownership_pubkey(other[:32] + payload[32:], DOMAIN) is None
+    # the current ck1 is not mistaken for an old one
+    current = recover_note_ownership_pubkey(decode_ck1(a["ck1"]), DOMAIN)
+    assert current is not None and not current.legacy
 
 
 def test_the_signed_message_is_over_the_key_for_a_ck1(notes):
@@ -231,7 +271,10 @@ def test_a_note_url_may_carry_a_ck1_but_not_a_cp1(notes, cert):
     a = notes[0]
     url = f"https://mint.example/w?k1={a['ck1']}&amount=1000&sig={cert['cs1']}"
     assert resolve_note_input(url) == url
-    # a cp1 is the note's public key: a URL carrying one spends nothing
+    assert resolve_note_input(f"lnurlw://MINT.EXAMPLE/w?k1={a['ck1']}") is not None
+    # signed for one mint, it is no note at another
+    assert resolve_note_input(f"https://elsewhere.example/w?k1={a['ck1']}") is None
+    # a cp1 is the note's public name: a URL carrying one spends nothing
     assert resolve_note_input(f"https://mint.example/w?k1={a['cp1']}&amount=1000") is None
 
 
@@ -258,20 +301,35 @@ def test_a_mint_echoing_another_spelling_of_the_same_note_is_believed(part2, not
     assert info.max_withdrawable == 21000
 
 
+@pytest.mark.parametrize("make", [raw_message_ck1, digest_message_ck1], ids=["raw", "sha256"])
+def test_a_mint_echoing_an_older_ck1_for_the_same_note_is_believed(part2, notes, make):
+    a = notes[0]
+    older = encode_ck1(make(bytes.fromhex(a["noteSecretKey"])))
+    request = note_info_request(f"https://mint.example/w?k1={a['ck1']}&amount=21000")
+    info = request.parse(_echoing(part2, older))
+    assert note_id_of(info.k1) == a["notePubkey"]
+
+
 def test_a_mint_echoing_a_different_notes_ck1_is_still_refused(part2, notes):
     # the check exists for exactly this: a different note, however well formed
     a, b = notes[0], notes[1]
     request = note_info_request(f"https://mint.example/w?k1={a['ck1']}&amount=21000")
     with pytest.raises(ProtocolError, match="different k1"):
         request.parse(_echoing(part2, b["ck1"]))
+    # and the right key under a signature that opens nothing is not the note
+    forged = bytearray(decode_ck1(a["ck1"]))
+    forged[40] ^= 0xFF
+    with pytest.raises(ProtocolError, match="different k1"):
+        request.parse(_echoing(part2, encode_ck1(bytes(forged))))
 
 
-def test_a_part2_note_is_looked_up_by_p_and_a_hash_by_h(notes):
+def test_every_note_is_looked_up_by_p(notes):
     a = notes[0]
     by_key = query(build_note_info_url_by_hash("https://mint.example/w", a["cp1"]))
     assert by_key == {"p": [a["cp1"]]}
+    # a bearer note's h is the cp1 slot's short form, and goes in the same place
     by_hash = query(build_note_info_url_by_hash("https://mint.example/w", hash_k1(K1)))
-    assert by_hash == {"h": [hash_k1(K1)]}
+    assert by_hash == {"p": [hash_k1(K1)]}
     # the ck1 is the bearer secret: naming it here would defeat the point
     with pytest.raises(ProtocolError):
         build_note_info_url_by_hash("https://mint.example/w", a["ck1"])
@@ -292,8 +350,11 @@ def test_a_lookup_by_cp1_brings_back_a_certificate_that_verifies(part2, notes, c
         }
     )
     assert info.signature == cert["cs1"]
-    assert verify_note_signature(
-        a["ck1"], info.max_withdrawable, info.signature, info.mint_pubkey
+    assert (
+        verify_note_signature(
+            a["ck1"], DOMAIN, info.max_withdrawable, info.signature, info.mint_pubkey
+        )
+        is Certification.CERTIFIED_OVER_Q
     )
 
 
@@ -308,19 +369,20 @@ def test_rotate_a_ck1_into_a_cp1_sent_as_p1(notes, cert):
     assert request.parse({"status": "OK", "sig": cert["cs1"]}).signature == cert["cs1"]
 
 
-def test_a_hash_output_keeps_h_which_every_mint_understands(notes):
+def test_a_bearer_output_goes_as_p1_too(notes):
+    # a bearer note's h is the cp1 slot's short form
     request = rotate_request_with_hash(CB, notes[0]["ck1"], hash_k1(K1))
-    assert query(request.url) == {"k1": [notes[0]["ck1"]], "h": [hash_k1(K1)]}
+    assert query(request.url) == {"k1": [notes[0]["ck1"]], "p1": [hash_k1(K1)]}
 
 
-def test_split_names_each_output_by_its_own_kind(notes):
+def test_split_names_both_outputs_p1_and_p2_whatever_they_are(notes):
     a, b, c = notes[0], notes[1], notes[2]
     mixed = query(split_request_with_hash(CB, [a["ck1"]], 5000, b["cp1"], hash_k1(K1)).url)
     assert mixed == {
         "k1": [a["ck1"]],
         "amount": ["5000"],
         "p1": [b["cp1"]],
-        "h2": [hash_k1(K1)],
+        "p2": [hash_k1(K1)],
     }
     keys = query(split_request_with_hash(CB, [a["ck1"]], 5000, b["cp1"], c["cp1"]).url)
     assert keys["p1"] == [b["cp1"]] and keys["p2"] == [c["cp1"]]
@@ -333,10 +395,11 @@ def test_one_merge_takes_a_part1_secret_and_a_part2_note(notes):
     assert query(request.url) == {"k1": [K1, a["ck1"]], "p1": [c["cp1"]]}
 
 
-# What each output is owed. A cp1 note is owed its cs1 whatever the policy
-# says, because without one it cannot be checked offline, which is the whole
-# reason to hold one. A legacy hash uses the raw Part 1 signature when
-# available; the caller decides whether no-signer omission is accepted.
+# What each output is owed. LUD-25 has a mint certify every note (a SHOULD).
+# An output named by cp1 is owed its cs1 whatever the policy says, because
+# offline verification is the reason to name it so. One named by a bearer h
+# may come back uncertified from a mint with no signer, unless the caller asks
+# for require_signatures.
 
 _EVERY_POLICY = [
     None,
@@ -469,15 +532,24 @@ def test_anything_else_is_refused_before_an_invoice_is_asked_for(notes, cert):
 # ---- the encodings ----
 
 
-def test_the_four_types_never_pass_for_one_another(part2, notes, cert):
-    a, cx1 = notes[0], part2["branches"][0]["cx1"]
-    checks = (is_cp1, is_ck1, is_cs1_with_amount, is_cx1)
-    assert [check(a["cp1"]) for check in checks] == [True, False, False, False]
-    assert [check(a["ck1"]) for check in checks] == [False, True, False, False]
-    assert [check(cert["cs1"]) for check in checks] == [False, False, True, False]
-    assert [check(cx1) for check in checks] == [False, False, False, True]
-    # and a plain hex k1 is none of them
-    assert [check(K1) for check in checks] == [False, False, False, False]
+def test_the_five_types_never_pass_for_one_another(part2, notes, cert):
+    a, cx1, cw1 = notes[0], part2["branches"][0]["cx1"], bearer_cw1(K1)
+    checks = (is_cp1, is_ck1, is_cw1, is_cs1_with_amount, is_cx1)
+    assert [check(a["cp1"]) for check in checks] == [True, False, False, False, False]
+    assert [check(a["ck1"]) for check in checks] == [False, True, False, False, False]
+    assert [check(cw1) for check in checks] == [False, False, True, False, False]
+    assert [check(cert["cs1"]) for check in checks] == [False, False, False, True, False]
+    assert [check(cx1) for check in checks] == [False, False, False, False, True]
+    # and a bearer preimage or h is none of them
+    assert [check(K1) for check in checks] == [False] * 5
+
+
+def test_an_off_curve_cp1_names_no_note():
+    # x = 5 has no point on secp256k1: a note there could never be spent
+    off_curve = encode_cp1((5).to_bytes(32, "big"))
+    assert decode_cp1(off_curve) is None and not is_cp1(off_curve)
+    with pytest.raises(RequestRefused):
+        mint_invoice_request_with_hash(PAY_CB, 21000, off_curve)
 
 
 def test_no_90_character_limit(notes, cert, part2):
@@ -584,15 +656,17 @@ def test_the_index_is_a_uint32(part2):
             derive_note_secret_key(sk, chain, bad)
 
 
-def test_a_tweak_at_or_above_n_is_refused_never_reduced(part2, monkeypatch):
-    # A ~2^-128 event nobody will meet, but reducing it would derive a key no
-    # other implementation derives, and the note behind it would be lost.
+def test_a_tweak_at_or_above_n_is_reduced_mod_n(part2, monkeypatch):
+    # A ~2^-128 event nobody will meet, but the spec requires t mod n, and
+    # lnurl-wallet reduces it: 2^256 - 1 derives exactly what 2^256 - 1 - n does
     sk, pk, chain = _branch(part2)
+    reduced = (2**256 - 1 - _CURVE_N).to_bytes(32, "big")
+    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(reduced))
+    want_pk, want_sk = derive_note_pubkey(pk, chain, 0), derive_note_secret_key(sk, chain, 0)
     monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(b"\xff" * 32))
-    with pytest.raises(ProtocolError, match="next index"):
-        derive_note_pubkey(pk, chain, 0)
-    with pytest.raises(ProtocolError, match="next index"):
-        derive_note_secret_key(sk, chain, 0)
+    assert derive_note_pubkey(pk, chain, 0) == want_pk
+    assert derive_note_secret_key(sk, chain, 0) == want_sk
+    assert PrivateKey(want_sk).public_key.format(compressed=True)[1:] == want_pk
 
 
 def test_a_tweak_that_lands_on_zero_is_refused(part2, monkeypatch):
@@ -628,27 +702,32 @@ def test_a_bad_branch_private_key_is_refused(part2):
 
 def test_a_truncated_or_corrupted_signature_is_not_the_note(notes):
     a = notes[0]
+    pk = bytes.fromhex(a["notePubkey"])
     payload = decode_ck1(a["ck1"])
     assert len(payload) == 96
-    assert recover_note_ownership_pubkey(payload) == bytes.fromhex(a["notePubkey"])
-    assert recover_note_ownership_pubkey(payload[:95]) is None
-    assert recover_note_ownership_pubkey(payload[:64]) is None
-    assert recover_note_ownership_pubkey(b"") is None
-    assert recover_note_ownership_pubkey(bytes([0xFF]) * 96) is None
-    assert recover_note_ownership_pubkey("not bytes") is None
+    owner = recover_note_ownership_pubkey(payload, DOMAIN)
+    assert owner is not None and owner.pubkey_x_only == pk and not owner.legacy
+    assert recover_note_ownership_pubkey(payload[:95], DOMAIN) is None
+    assert recover_note_ownership_pubkey(payload[:64], DOMAIN) is None
+    assert recover_note_ownership_pubkey(b"", DOMAIN) is None
+    assert recover_note_ownership_pubkey(bytes([0xFF]) * 96, DOMAIN) is None
+    assert recover_note_ownership_pubkey("not bytes", DOMAIN) is None
     for at in (10, 40, 90):
         corrupted = bytearray(payload)
         corrupted[at] ^= 0xFF
-        assert recover_note_ownership_pubkey(bytes(corrupted)) != bytes.fromhex(a["notePubkey"])
+        recovered = recover_note_ownership_pubkey(bytes(corrupted), DOMAIN)
+        assert recovered is None or recovered.pubkey_x_only != pk
     # a key and a valid signature by a different key is not a proof
     b = decode_ck1(notes[1]["ck1"])
-    assert recover_note_ownership_pubkey(payload[:32] + b[32:]) is None
+    assert recover_note_ownership_pubkey(payload[:32] + b[32:], DOMAIN) is None
+    # and a current ck1 at another mint opens nothing
+    assert recover_note_ownership_pubkey(payload, "elsewhere.example") is None
 
 
 def test_signing_refuses_a_key_that_is_not_one():
     for bad in [bytes(32), bytes(31), b"\x01", _CURVE_N.to_bytes(32, "big")]:
         with pytest.raises(ProtocolError):
-            sign_note_ownership(bad)
+            sign_note_ownership(bad, DOMAIN)
 
 
 # ---- derivation entry points ----

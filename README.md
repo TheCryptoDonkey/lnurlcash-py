@@ -16,12 +16,14 @@ An ordinary [LUD-03](https://github.com/lnurl/luds/blob/luds/03.md)
 withdrawRequest link whose `k1` **is** the asset:
 
 ```
-lnurlw://mint.example/w?k1=<secret>&amount=<msat>
+lnurlw://mint.example/w?k1=<spend>&amount=<msat>
 ```
 
 Whoever knows the `k1` controls the sats behind it, like a banknote. The
 `amount` alongside it is only a claim by whoever encoded the note; the
 authoritative value is always `maxWithdrawable` from an informational GET.
+Every note is a BIP-341 taproot output key `Q`, and the `k1` is a spend of it:
+see [Notes, spends and certificates](#notes-spends-and-certificates).
 
 ## Usage
 
@@ -39,11 +41,12 @@ print(info.max_withdrawable, "msat")
 
 fresh = client.rotate_note(info.callback, info.k1)   # that GET exposed the secret
 
-# A reference mint returns a raw Part 1 signature when it has a signer, and
-# may omit it in no-signer mode. For an amount-bearing certificate, rotate
-# into a cp1 key (see Part 2 below).
+# The mint certifies the new note over its hex(Q) when it has a signer, and
+# omits the certificate when it has none.
 if fresh.signature is not None:
-    verify_note_signature(fresh.k1, info.max_withdrawable, fresh.signature, info.mint_pubkey)
+    verify_note_signature(
+        fresh.k1, url, info.max_withdrawable, fresh.signature, info.mint_pubkey
+    )
 ```
 
 `AsyncLnurlcashClient` has the identical surface with `await`. Both accept
@@ -79,11 +82,11 @@ response means: neither of them decides.
 ## The five things that will cost you money
 
 **1. Never let the service generate a replacement secret.** On rotate, split
-and merge the *wallet* draws a fresh 32 bytes and discloses only
-`sha256(secret)` as `h`. A service-issued replacement has, structurally, been
-seen by that service — so a "rotate" that accepts one closes no exposure at
-all. This library generates them and ignores any `k1` a non-compliant service
-hands back.
+and merge the *wallet* draws a fresh 32-byte preimage and discloses only its
+`h = sha256(preimage)`, as `p1` (and `p2`). A service-issued replacement has,
+structurally, been seen by that service, so a "rotate" that accepts one
+closes no exposure at all. This library generates them and ignores any `k1` a
+non-compliant service hands back.
 
 **2. A failed mutation is not a failure.** If a rotate times out, the service
 may already have burned your input and minted the output, and the fresh
@@ -126,33 +129,35 @@ fresh = client.rotate_note(callback, old_k1)
 give-up-at-once behaviour). Only rotate, split and merge are re-sent — never a
 melt, which carries `pr`, is paid asynchronously and has no replay guarantee —
 and only an ambiguous failure, never a refusal the service actually considered.
-The re-sent request is byte-identical, because the replay is matched on the k1
-set, `h`, `h2` and `amount`.
+The re-sent request is byte-identical: the replay is matched on the notes the
+`k1`s open, `p1`, `p2` and `amount`, and a fresh secret would make it a
+different mutation.
 
 `httpx` does not retry by default, which is still what this library wants: a
 deliberate retry it counts is a different thing from an invisible one it does
 not. If you pass your own client, do not configure a retrying transport.
 
-**3b. Legacy hashes and `cp1` outputs use different proof formats.** A rotate,
-split or merge to a `cp1` output
-that the service confirms without its `cs1` (in `sig`, or `sig2` for a split's
-change) raises `UnverifiableNote`, whatever the policy says. A mutation to a
-legacy hash output carries the reference mint's raw Part 1 signature when a
-signer is available and may have `signature=None` in no-signer mode.
+**3b. An output named by a `cp1` is owed its certificate.** LUD-25 has a mint
+certify every note with a `cs1` over its `hex(Q)`, a bearer note included; it
+is a SHOULD, and a mint with no signer omits it. A rotate, split or merge to
+an output named by a `cp1` that the service confirms without its `cs1` (in
+`sig`, or `sig2` for a split's change) raises `UnverifiableNote`, whatever the
+policy says: offline verification is the reason to name a note that way. An
+output named by a bearer `h` may have `signature=None`.
 
 `UnverifiableNote` **carries the fresh secrets** the library generated,
 because the mutation landed and the note it minted is real. Read them with
 `new_secrets_of` and persist them before anything else. It is empty after a
 `*_with_hash` call, whose caller named the output and already holds its key.
 
-Two `Policy` fields tune the rest. `require_signatures=True` demands the raw
-Part 1 signature over a hash output, matching the committed reference wallet.
-`require_mint_pubkey` (default `True`) makes `fetch_note_info` raise
-`ProtocolError` for a `withdrawRequest` publishing no valid `mintPubkey`; set
-it `False` for a Part 1-only mint that publishes none.
+Two `Policy` fields tune the rest. `require_signatures=True` demands a
+certificate for an output named by a bearer `h` too. `require_mint_pubkey`
+(default `True`) makes `fetch_note_info` raise `ProtocolError` for a
+`withdrawRequest` publishing no valid `mintPubkey`; set it `False` for a mint
+that publishes none.
 
 ```python
-client = LnurlcashClient(policy=Policy(require_signatures=True))  # the old default
+client = LnurlcashClient(policy=Policy(require_signatures=True))
 ```
 
 **4. A melt's `OK` means "in flight", not "spent".** The service pays
@@ -170,8 +175,8 @@ invoice. First rotater wins.
 
 ## Seed derivation
 
-LUD-25 Part 2 derives a per-mint branch from the wallet seed, and this library
-implements the specified path:
+LUD-25 derives a per-mint branch of note keys from the wallet seed, and this
+library implements the specified path:
 
 ```
 cashHashingKey   = m/139'/0
@@ -189,12 +194,12 @@ root = derive_cash_root(seed)                   # m/139'
 node = derive_cash_domain_node(root, host)      # m/139'/d1/d2/d3/d4
 ```
 
-That node is Part 2's address branch (`derive_cash_address_node` returns the
-same one). Whoever holds it can derive every note key held at that mint -
-provisioning material, one mint's subtree, not the wallet.
+That node is the address branch of key-path notes (`derive_cash_address_node`
+returns the same one). Whoever holds it can derive every note key held at that
+mint - provisioning material, one mint's subtree, not the wallet.
 
-Part 1 secrets are plain randomness, as LUD-25's Part 1 text says. They are
-not derived from the seed.
+Bearer preimages are plain randomness, as LUD-25 says. They are not derived
+from the seed, so back them up by other means or rotate them into a key.
 
 `derive_note_root` / `derive_note_secret` are the pre-spec HMAC scheme this
 project shipped before the draft had one. Not deprecated, because notes minted
@@ -202,59 +207,101 @@ under it are still money; just not what to mint under.
 `note_info_by_hash_request` is the private lookup a restore walk should use:
 asking by secret publishes the very secret being checked.
 
-## Notes keyed by a public key (LUD-25 Part 2)
+## Notes, spends and certificates
 
-A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`. The mint
-only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, the
-32-byte `pk` followed by a BIP-340 Schnorr signature by `sk` over
-`sha256("LNURLcash")`. The mint verifies the pair and uses `pk` to find the
-note. The mint's certificate, `cs1…`, carries
-the note amount in its prefix using BOLT 11 amount rules and contains the
-signature over `LNURLcash:<amount_msat>:<hex(pk)>`, so a recipient can recover
-the claimed amount and check the note offline.
+Every LUD-25 note is a BIP-341 taproot output key `Q`, written `cp1…`, and a
+mint files it under `hex(Q)`. A `k1` is a spend that opens one:
 
-The protocol calls take both kinds. A `ck1` goes anywhere a `k1` does: a note
-URL, `fetch_note_info`, rotate, split, merge and melt. A `cp1` goes anywhere an
-output does: `mint_invoice_request_with_hash`, and the output of every
-`*_with_hash` call, where it is sent as `p1`/`p2` while a hash keeps `h`/`h2`,
-the same rule as lnurl-wallet. `note_id_of(k1)` gives the id a mint files
-either kind under, and `note_lookup_of(k1)` what to pass
-`note_info_by_hash_request` to check a note without disclosing it. For a Part
-2 note that answer carries the note's `cs1` as `signature`.
+- **A bearer note's preimage**, 64 hex. The note is the one-leaf hashlock
+  `OP_SHA256 <h> OP_EQUAL` under BIP-341's NUMS key, so the preimage is the
+  short form of its script-path spend, and `h = sha256(preimage)` is the short
+  form of its `cp1`. It signs nothing, so it spends its note at any mint.
+- **A `ck1`**: `Q` and a BIP-340 signature by `Q` over the key-path sighash of
+  a fixed, never-broadcast transaction whose prevout is bound to the mint's
+  domain. It spends its note at that mint and nowhere else.
+- **A `cw1`**: a leaf, its control block and the witness the leaf consumes,
+  for any script tree. `Q` is recomputed from the control block.
+
+```python
+spend = verify_spend(k1, note_url)   # opens which Q, at this mint? None if nothing
+note_id_of(k1)                       # hex(Q): compare notes by this, never by k1
+note_lookup_of(k1)                   # h or cp1, for note_info_by_hash_request
+```
+
+A key-path note's key comes from the seed, and its `ck1` needs the mint's
+domain, which every call takes as a URL or a bare host and reduces to the
+lowercase hostname (`spend_domain_of`):
 
 ```python
 from lnurlcash_kit import (
     cash_node_to_cx1, derive_cash_address_node, derive_cash_root,
-    decode_cs1_with_amount, derive_note_pubkey, derive_note_secret_key,
-    encode_ck1, encode_cp1, encode_cx1, sign_note_ownership,
-    verify_note_signature,
+    derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1,
+    encode_cx1, sign_note_ownership,
 )
 
 node = derive_cash_address_node(derive_cash_root(seed), "mint.example")
 branch = cash_node_to_cx1(node)
 watch_only = encode_cx1(branch.pubkey_x_only, branch.chain_code)
 
-pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i)  # what a watcher derives
+pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i)  # Q, used as is
 sk = derive_note_secret_key(node.private_key, node.chain_code, i)
-ck1 = encode_ck1(sign_note_ownership(sk))                            # the bearer secret
+ck1 = encode_ck1(sign_note_ownership(sk, "mint.example"))           # spends at mint.example only
 
 client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1; its cs1 is owed
-verify_note_signature(ck1, amount_msat, cs1, mint_pubkey)            # offline
-certificate = decode_cs1_with_amount(cs1)                            # amount + signature
 ```
 
-`encode_cs1_with_amount`, `decode_cs1_with_amount` and
-`is_cs1_with_amount` are the current wire API. The fixed-prefix `encode_cs1`,
-`decode_cs1` and `is_cs1` remain for legacy notes; `decode_any_cs1` and
-`is_any_cs1` accept either form during migration. Verification accepts both,
-matching the reference kit; decode the certificate separately if the
-application needs to compare its carried amount with another value.
+All-zero `aux_rand` makes a `ck1` a deterministic function of the key and the
+domain, so seed recovery reproduces it byte for byte. `ck1`s signed before
+spends moved onto the sighash (over `sha256("LNURLcash")`, over the raw
+string, or the 65-byte recoverable ECDSA shape) are still read, and
+`verify_spend` and `recover_note_ownership_pubkey` report them as `legacy`:
+rotate those notes into a current `ck1`.
+
+`encode_cw1`, `decode_cw1`, `output_key_of_cw1` and `bearer_cw1` handle
+script-path spends; `key_path_sighash`, `script_path_sighash` and
+`spend_sig_msg` give the hash a signer inside a leaf needs. There is no script
+interpreter: a bearer hashlock is the one leaf this library evaluates, and any
+other `cw1` is checked for structure, `Q` and LUD-25's leaf rules
+(`check_leaf_policy`), then reported as `unevaluated`. The mint judges its
+witness, and its time claim against its own clock (`check_time_claim`
+predicts the answer).
+
+A certificate, `cs1…`, carries the amount in its prefix by BOLT 11 amount
+rules and signs `LNURLcash:<amount_msat>:<hex(Q)>`. A recipient checks a note
+offline from its URL alone:
+
+```python
+amount, certified = verify_note_url(note_url, mint_pubkey)
+# or piecewise:
+certified = verify_note_signature(k1, note_url, amount_msat, cs1, mint_pubkey)
+```
+
+Both return a `Certification`: `CERTIFIED_OVER_Q`, as LUD-25 specifies;
+`CERTIFIED_OVER_HASH` for a bearer note certified over its `h` by a mint from
+before notes were keyed by `Q`; or `NOT_CERTIFIED`, the only falsy one.
+`verify_note_signature` checks that `k1` opens its note at the URL's domain
+first. `verify_note_signature_hash` takes a bearer note's `h` instead, and
+`verify_note_signature_for_key` a `hex(Q)`, for a watcher that holds no
+spend. A certificate proves issuance, not that the note is still outstanding:
+rotate a received note once online.
+
+`encode_cs1_with_amount`, `decode_cs1_with_amount` and `is_cs1_with_amount`
+are the current wire API; the fixed-prefix `encode_cs1`, `decode_cs1` and
+`is_cs1` remain for legacy certificates, and `decode_any_cs1` and
+`is_any_cs1` accept either.
+
+On the wire, a spend goes anywhere a `k1` does. An output, a `cp1` or a
+bearer `h`, goes as `p1`/`p2` on a rotate, split or merge, as `p` on a lookup,
+and as the comment on a mint invoice (a bearer `h` also as `h`, for mints that
+took that parameter first). A `cp1` whose key is not a curve point is refused
+before anything is sent.
 
 Reference-mint address management proves control with the address branch's
-index-0 private key. `sign_address_proof(sk0, action, username)` returns the
-raw 64-byte BIP-340 proof over `sha256("LNURLcash:<action>:<username>")`;
-action is `register` or `unregister`, and the username must be normalised
-exactly as it is sent to the service.
+index-0 key. `sign_address_proof(sk0, action, domain, username)` returns the
+raw 64-byte BIP-340 proof over
+`sha256("LNURLcash:<action>:<domain>:<username>")`; action is `register` or
+`unregister`, the domain is the mint's own, and the username must be
+normalised exactly as it is sent to the service.
 
 Three things worth knowing:
 
@@ -266,14 +313,9 @@ Three things worth knowing:
   whoever holds it can list every key on the branch and ask the mint about
   each one. Register it with a mint and that mint sees everything paid to the
   address. Use the branch for receiving and rotate off it.
-- **A `ck1` is deterministic from its note key**, so seed recovery reproduces
-  it byte for byte. The decoder and lookup helpers also accept the old 65-byte
-  recoverable-ECDSA shape, and a Schnorr `ck1` signed over the raw message
-  rather than its digest, so existing notes stay spendable; rotate those into
-  a current `ck1` rather than issuing new legacy values. Compare notes by
-  `note_id_of`, never by the string. `fetch_note_info` does: a mint that
-  echoes another valid `ck1` for the same key has named that note, and only a
-  different note is refused.
+- **Compare notes by `note_id_of`, never by the string.** `fetch_note_info`
+  does: a mint that echoes another spend of the same note, valid at that
+  mint, has named that note, and only a different note is refused.
 
 **A branch rooted in a Nostr key.** This one is ours, not LUD-25's. A holder
 with no BIP-39 words, such as a hardware signer that keeps only its identity
@@ -286,8 +328,9 @@ notes come back from the nsec without the device. A mint sees an ordinary
 
 Both are graded against lnurlcash-conformance's `vectors/part2.json` and
 `vectors/nostr-seed.json`: every branch, key, signature, certificate and
-string in them, and against `vectors/spec-vectors.json`, the numbers LUD-25's
-own text publishes.
+string in them. The spends are graded against `vectors/spends.json`, and all
+of it against `vectors/spec-vectors.json`, the numbers LUD-25's own text
+publishes.
 
 ## Errors
 
@@ -297,10 +340,11 @@ own text publishes.
 | `ServiceRejected` | processed and refused. Definitive. |
 | `NotePending` | a melt is in flight on this `k1`. Retry. |
 | `NoteSpent` | authoritative: already burned. |
+| `OutputInUse` | `already in use`: an output you named is taken. Nothing burned; name a fresh one. |
 | `NoteUnknown` | the service does not recognise it. |
 | `AmbiguousMint` | outcome **unknown**. Assume nothing. |
 | `AmbiguousMutation` | as above, carrying `.new_secrets`. |
-| `UnverifiableNote` | the mutation **landed** without a signature it owed: a `cp1` output's `cs1`, or a hash output's Part 1 signature under `require_signatures=True`. The note is real; carries `.new_secrets`. |
+| `UnverifiableNote` | the mutation **landed** without a certificate it owed: for an output named by `cp1`, or by a bearer `h` under `require_signatures=True`. The note is real; carries `.new_secrets`. |
 | `ProtocolError` | a non-mutating response did not match the spec, including a `withdrawRequest` with no `mintPubkey` (unless `require_mint_pubkey=False`). |
 
 Branch on the class, never on the message.
