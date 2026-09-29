@@ -3,7 +3,7 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## Unreleased
+## 0.2.0 - 2026-09-29
 
 **Breaking.** The address branch moves, so a `cx1` from 0.1.0 names a
 different branch, and `ck1` and address proofs change format again: a `ck1`

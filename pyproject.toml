@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lnurlcash-kit"
-version = "0.1.0"
+version = "0.2.0"
 description = "LNURLcash (LUD-25) bearer note client for Python - mint, rotate, split, merge, melt, and verify offline"
 readme = "README.md"
 license = "MIT"
