@@ -11,6 +11,31 @@ now signs for one mint's domain, a note is filed under `hex(Q)`, and every
 call that signs or verifies a `ck1` or an address proof takes the mint's
 domain. A 0.1.0 `ck1` stays readable so its note can be rotated.
 
+### Derivation purposes, `c` and `text/cpub` (LUD-25 `50d740a`)
+
+Brought to luds `50d740a` (2026-09-25), graded against
+`lnurlcash-conformance` 0.15.0.
+
+- **Breaking: the note tweak takes a purpose.** `t = tagged_hash("LNURLcash/
+  derive", P || chaincode || ser32(purpose) || ser32(i)) mod n`, so every note
+  key moves. `derive_note_pubkey` and `derive_note_secret_key` take
+  `purpose`, a keyword-friendly fourth argument defaulting to `PURPOSE_WALLET`
+  (0: a wallet's own notes and a split's `p1`); `PURPOSE_CHANGE` (1) is a
+  split's change `p2` and `PURPOSE_LIGHTNING_ADDRESS` (2) is a note credited by
+  Lightning Address auto-mint or an internal transfer. Each purpose has its
+  own counter, so recovery scans all three. The address registration proof and
+  the address key are purpose 0, index 0. One `cx1` still covers every
+  purpose.
+- **Certificates are `c` and `c2`**, not `sig` and `sig2`, in withdraw
+  responses and on the informational GET, and a certified note URL carries
+  `&c=<cs1>`. Requests and rewritten note URLs use the new names only. The
+  legacy `sig`, `sig2` and `&sig=` are still READ, `c` winning where both are
+  present, so a mint or a note from before the rename keeps working. The
+  registration-proof request parameter stays `sig`.
+- `text/xpub` is now `text/cpub` in the LUD-16 internal-transfer hint. This
+  package neither builds nor reads payRequest metadata, so there is nothing to
+  change here.
+
 ### Every note is a taproot output key (LUD-25 `6e865b1`)
 
 LUD-25's unified taproot model (luds `6e865b1`, "unified taproot

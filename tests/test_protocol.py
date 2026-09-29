@@ -900,3 +900,16 @@ def test_lnurl_mints_wording_of_already_in_use():
             LnurlcashClient(client=http).rotate_note_with_hash(
                 "https://mint.example/w/cb", secret(), hash_k1(secret())
             )
+
+
+@pytest.mark.parametrize("names", ["c", "sig", "both"])
+def test_certificates_are_read_under_either_name(mint, client, names):
+    # a mint that has not yet renamed sig to c (LUD-25, luds 50d740a) still
+    # hands a holder its certificate
+    m = mint(certificateNames=names)
+    k1 = secret()
+    signature = m.credit(k1, 21000)
+    assert signature
+    info = client.fetch_note_info(m.note_url(k1))
+    assert info.signature == signature
+    assert verify_note_signature(k1, m.url, 21000, info.signature, m.pubkey)

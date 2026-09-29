@@ -61,7 +61,7 @@ class Policy:
     LUD-25 has a SERVICE certify every note it issues (a SHOULD), a bearer
     note included, since every note now has a public ``Q``. This library goes
     further for an output the caller named by ``cp1``: a rotate, split or
-    merge to one MUST come back with its ``cs1`` in ``sig`` (``sig2`` for a
+    merge to one MUST come back with its ``cs1`` in ``c`` (``c2`` for a
     split's change), because offline verification is the reason to name a
     note that way, and nothing here turns it off. An output named by a bearer
     note's hex ``h`` may come back uncertified, as it does from a mint with no
@@ -115,7 +115,7 @@ class WithdrawRequestInfo:
     #: ever None when the caller passed a Policy with ``require_mint_pubkey``
     #: false.
     mint_pubkey: str | None = None
-    #: the response's ``sig``: the SERVICE's cs1 certificate over the note's
+    #: the response's ``c``: the SERVICE's cs1 certificate over the note's
     #: ``hex(Q)`` and current amount, so a holder need not force a rotate just
     #: to get one. Passed on as sent and never checked here -
     #: :func:`~lnurlcash_kit.signature.verify_note_signature` is the check.
@@ -338,11 +338,19 @@ def _optional_iso_date(value: Any) -> str | None:
     return value if parsed.isoformat() == value else None
 
 
+def _certificate_field(body: dict, name: str, legacy: str) -> Any:
+    """A certificate as LUD-25 names it (``c``, ``c2``). ``legacy`` (``sig``,
+    ``sig2``) is what earlier drafts and mints called it, and is still READ
+    when the current name is absent; nothing here sends it."""
+    value = body.get(name)
+    return value if value is not None else body.get(legacy)
+
+
 def _optional_signature(body: dict) -> str | None:
-    """An informational GET's ``sig``, or nothing. Display and verification
-    material only, so a SERVICE sending something that is not a string gets
-    it dropped rather than the whole response refused."""
-    value = body.get("sig")
+    """An informational GET's ``c`` (or legacy ``sig``), or nothing. Display
+    and verification material only, so a SERVICE sending something that is not
+    a string gets it dropped rather than the whole response refused."""
+    value = _certificate_field(body, "c", "sig")
     return value if isinstance(value, str) and value else None
 
 
@@ -382,12 +390,12 @@ def _same_note(a: str, b: str, note_url: str) -> bool:
 def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
     """LUD-03 step one. Never burns, rotates or alters the note.
 
-    ``sig`` is stripped before the request: it is only meaningful to a holder
-    inspecting the note locally, since the SERVICE already knows what it
+    The certificate (``c``, or legacy ``sig``) is stripped before the request:
+    it is only meaningful to a holder inspecting the note locally, since the SERVICE already knows what it
     signed. ``k1`` and ``amount`` are left as they are.
     """
     parts = urlparse(url)
-    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "sig"]
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in ("c", "sig")]
     request_url = urlunparse(parts._replace(query=urlencode(query)))
     queried = note_k1(url)
 
@@ -671,7 +679,7 @@ def rotate_request_with_hash(
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "rotate", h)
+            signature=_require_signature(_certificate_field(ok, "c", "sig"), policy, "rotate", h)
         )
 
     return Request(url=url, parse=parse, replayable=True)
@@ -688,7 +696,7 @@ def split_request_with_hash(
     """Split into ``amount_msat`` at ``h`` and the change at ``h2``, each a
     bearer ``h`` or a ``cp1``. Each output is owed what its naming is owed,
     exactly as in :func:`rotate_request_with_hash`: a ``cp1`` change without
-    ``sig2`` raises, a bearer change without one is taken as it is."""
+    ``c2`` raises, a bearer change without one is taken as it is."""
     url = _callback(
         callback,
         [("k1", k1) for k1 in k1s]
@@ -701,9 +709,9 @@ def split_request_with_hash(
         # is owed: a cp1 change is no lesser note than a cp1 first output.
         # Checked in output order so the message names the one missing.
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "split", h),
+            signature=_require_signature(_certificate_field(ok, "c", "sig"), policy, "split", h),
             change_signature=_require_signature(
-                ok.get("sig2"), policy, "split's change", h2
+                _certificate_field(ok, "c2", "sig2"), policy, "split's change", h2
             ),
         )
 
@@ -718,7 +726,7 @@ def merge_request_with_hash(
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "merge", h)
+            signature=_require_signature(_certificate_field(ok, "c", "sig"), policy, "merge", h)
         )
 
     return Request(url=url, parse=parse, replayable=True)

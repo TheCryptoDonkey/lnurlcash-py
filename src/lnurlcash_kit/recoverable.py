@@ -244,14 +244,26 @@ def is_cx1(value: str) -> bool:
 
 # ---- the per-note key tweak ----
 #
-#     t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(i))
+#     t    = tagged_hash("LNURLcash/derive",
+#                        P || chainCode || ser32_be(purpose) || ser32_be(i)) mod n
 #     pk_i = x(lift_x(P) + t*G)
 #     sk_i = ((P has even y ? p : n - p) + t) mod n
 #
 # BIP-341's taproot tweak, so a watcher holding only the cx1 computes the same
-# pk_i the holder does. i is any uint32 and is never hardened. The 4-byte
-# big-endian width is what lnurl-wallet and lnurl-mint both use; the spec text
-# does not pin it.
+# pk_i the holder does. purpose and i are any uint32 and never hardened. The
+# purpose splits a branch into three independent counters (LUD-25, Seed &
+# derivation), so a wallet's own indices and a SERVICE's auto-minted ones never
+# collide by coincidence. The 4-byte big-endian width is what lnurl-wallet and
+# lnurl-mint both use; the spec text does not pin it.
+
+#: every note the wallet itself mints, rotates or merges into, and a split's
+#: resulting note (p1). The registration proof and the address key use index 0
+#: of this purpose.
+PURPOSE_WALLET = 0
+#: a split's change note (p2)
+PURPOSE_CHANGE = 1
+#: a note credited by Lightning Address auto-mint or an internal transfer
+PURPOSE_LIGHTNING_ADDRESS = 2
 
 _NOTE_DERIVE_TAG = sha256(b"LNURLcash/derive").digest()
 
@@ -262,37 +274,46 @@ def _unusable(index: int) -> ProtocolError:
     )
 
 
-def _require_uint32(index: int) -> int:
+def _require_uint32(index: int, what: str = "index") -> int:
     # bool is an int to Python, and True is not an index anyone meant
     if isinstance(index, bool) or not isinstance(index, int):
-        raise ProtocolError(f"a note index must be a uint32, not {index!r}")
+        raise ProtocolError(f"a note {what} must be a uint32, not {index!r}")
     if not 0 <= index <= 0xFFFFFFFF:
-        raise ProtocolError(f"a note index must be a uint32, not {index}")
+        raise ProtocolError(f"a note {what} must be a uint32, not {index}")
     return index
 
 
-def _tweak_for(pubkey_x_only: bytes, chain_code: bytes, index: int) -> int:
+def _tweak_for(
+    pubkey_x_only: bytes, chain_code: bytes, index: int, purpose: int
+) -> int:
     if len(pubkey_x_only) != 32 or len(chain_code) != 32:
         raise ProtocolError(
             "a branch is a 32-byte x-only public key and a 32-byte chain code"
         )
+    ser_purpose = _require_uint32(purpose, "purpose").to_bytes(4, "big")
     ser = _require_uint32(index).to_bytes(4, "big")
-    material = _NOTE_DERIVE_TAG + _NOTE_DERIVE_TAG + pubkey_x_only + chain_code + ser
+    material = (
+        _NOTE_DERIVE_TAG + _NOTE_DERIVE_TAG + pubkey_x_only + chain_code + ser_purpose + ser
+    )
     # reduced mod n, as the spec requires and lnurl-wallet does (lnurl-mint
     # refuses t >= n instead; at ~2^-128 the two never meet)
     return int.from_bytes(sha256(material).digest(), "big") % _CURVE_N
 
 
 def derive_note_pubkey(
-    branch_pubkey_x_only: bytes, chain_code: bytes, index: int
+    branch_pubkey_x_only: bytes,
+    chain_code: bytes,
+    index: int,
+    purpose: int = PURPOSE_WALLET,
 ) -> bytes:
-    """The i-th note's x-only public key, from the branch's public half alone.
+    """The note at ``purpose`` and ``index``: its x-only public key, from the
+    branch's public half alone.
 
     Watch-only: it needs no private key, which is what lets a SERVICE holding
     a registered cx1 mint straight to the holder's next key.
     """
     branch_x = bytes(branch_pubkey_x_only)
-    t = _tweak_for(branch_x, bytes(chain_code), index)
+    t = _tweak_for(branch_x, bytes(chain_code), index, purpose)
     try:
         branch = PublicKey(b"\x02" + branch_x)
     except ValueError as err:
@@ -309,9 +330,13 @@ def derive_note_pubkey(
 
 
 def derive_note_secret_key(
-    branch_private_key: bytes, chain_code: bytes, index: int
+    branch_private_key: bytes,
+    chain_code: bytes,
+    index: int,
+    purpose: int = PURPOSE_WALLET,
 ) -> bytes:
-    """The holder's half: the i-th note's 32-byte secret key.
+    """The holder's half: the 32-byte secret key of the note at ``purpose`` and
+    ``index``.
 
     The branch key's own point may have odd y, and a cx1 carries only x, which
     names the even-y point, so the key is negated first. Without that the note
@@ -322,7 +347,7 @@ def derive_note_secret_key(
     if len(key) != 32 or not 0 < p < _CURVE_N:
         raise ProtocolError("a branch private key is a 32-byte scalar in [1, n)")
     branch = PrivateKey(key).public_key.format(compressed=True)
-    t = _tweak_for(branch[1:], bytes(chain_code), index)
+    t = _tweak_for(branch[1:], bytes(chain_code), index, purpose)
     even = p if branch[0] == 0x02 else _CURVE_N - p
     note = (even + t) % _CURVE_N
     if note == 0:

@@ -61,7 +61,7 @@ class MockMint:
             f"{self.url}/_test/credit", params={"k1": k1, "amount": amount_msat}
         ).json()
         assert body["status"] == "OK", body
-        return body.get("sig")
+        return body.get("c") or body.get("sig")
 
     def settle(self, payment_hash: str) -> None:
         """Mark an invoice paid. The mock invents its invoices, so nothing can

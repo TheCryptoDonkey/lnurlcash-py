@@ -828,17 +828,17 @@ def test_part2_branch(branch):
     ids=lambda v: _branch_id(v) if "mnemonic" in v else f"#{v['index']}",
 )
 def test_part2_note(branch, note):
-    index = note["index"]
+    index, purpose = note["index"], note["purpose"]
     node = cash_node_from_hex(branch["addressNode"])
 
     # the watcher's half, from nothing but the cx1
     watched = decode_cx1(branch["cx1"])
     assert watched is not None
-    pk = derive_note_pubkey(watched.pubkey_x_only, watched.chain_code, index)
+    pk = derive_note_pubkey(watched.pubkey_x_only, watched.chain_code, index, purpose)
     assert pk.hex() == note["notePubkey"]
 
     # the holder's half, and that it is the key the watcher derived
-    sk = derive_note_secret_key(node.private_key, node.chain_code, index)
+    sk = derive_note_secret_key(node.private_key, node.chain_code, index, purpose)
     assert sk.hex() == note["noteSecretKey"]
     assert PrivateKey(sk).public_key.format(compressed=True)[1:] == pk
 
@@ -995,9 +995,13 @@ def test_nostr_seed(case):
 
     assert case["notes"]
     for note in case["notes"]:
-        sk = derive_note_secret_key(node.private_key, node.chain_code, note["index"])
+        sk = derive_note_secret_key(
+            node.private_key, node.chain_code, note["index"], note["purpose"]
+        )
         assert sk.hex() == note["noteSecretKey"]
-        pk = derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, note["index"])
+        pk = derive_note_pubkey(
+            cx1.pubkey_x_only, cx1.chain_code, note["index"], note["purpose"]
+        )
         assert pk.hex() == note["notePubkey"]
         assert encode_cp1(pk) == note["cp1"]
         _grade_key_path_note(sk, pk, note, case["domain"])
@@ -1034,11 +1038,11 @@ def test_spec_vector_branch_and_notes(name):
     case = load_vectors(_SPEC)[name]
     branch, cx1 = _spec_branch(case)
     for note in case["notes"]:
-        index = note["index"]
-        pk = derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, index)
+        index, purpose = note["index"], note["purpose"]
+        pk = derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, index, purpose)
         assert pk.hex() == note["pk"], index
         assert encode_cp1(pk) == note["cp1"], index
-        sk = derive_note_secret_key(branch.private_key, branch.chain_code, index)
+        sk = derive_note_secret_key(branch.private_key, branch.chain_code, index, purpose)
         assert sk.hex() == note["sk"], index
         # x(sk_i . G) == pk_i, the round trip 25.md calls out explicitly
         assert PrivateKey(sk).public_key_xonly.format() == pk, index
@@ -1194,6 +1198,9 @@ def test_an_independent_wallet_derives_the_same_literal_path():
         "62ba198d1cf6f086f85f867aff7f8d6845a65dd93152df219f1815d1f707bc99"
     )
     cx1 = cash_node_to_cx1(node)
-    assert derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, 0).hex() == (
-        "6fb7c0137fc17fccb337947b361580b7686219f2eeab9d47ed52a49191d5136c"
+    # the branch is that wallet's own; the note key is recomputed for the
+    # purpose-aware tweak of luds 50d740a (purpose 0, index 0) with hashlib and
+    # coincurve alone, since the wallet's own first key predates purposes
+    assert derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, 0, 0).hex() == (
+        "be5f31ff0b2bc0329961bcb08722b3033ab77a8bb35c776236a15d35afd911ab"
     )

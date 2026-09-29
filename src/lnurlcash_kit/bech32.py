@@ -4,7 +4,7 @@ The reference implementation from BIP-173, by Pieter Wuille, vendored rather
 than pulled in as a dependency: it is sixty lines of checksum arithmetic with
 no crypto in it, and a bearer-money library is better off with one fewer
 supply-chain edge. LNURL raises the length limit well above bech32's default,
-because a note URL carrying k1, amount and sig is long.
+because a note URL carrying k1, amount and certificate is long.
 
 bech32m (BIP-350) differs from bech32 in one constant, the value the checksum
 is XORed with, so it is the same code with that constant passed in. The two

@@ -72,7 +72,8 @@ returns Request(url, parse, new_secrets) and performs no I/O.
 5. A melt's OK means IN FLIGHT, not spent. NotePending means retry, not spent.
 5b. A mint SHOULD certify every note with a cs1 over hex(Q), a bearer note
    included. A rotate/split/merge to an output named by a cp1 (p1, or p2 for
-   a split's change) MUST return its cs1 in sig (sig2 for the change) - this
+   a split's change) MUST return its cs1 in c (c2 for the change; a pre-50d740a mint's sig/sig2
+   are still read, never sent) - this
    library's rule, stricter than LUD-25's SHOULD - and a missing one raises
    UnverifiableNote WHATEVER the policy says. An output named by a bearer h
    may come back with signature None from a mint with no signer.
@@ -179,11 +180,17 @@ derive_cash_address_node(root, host) -> CashNode   m/139'/d1/d2/d3/d4, hashing
   key m/139'/0: the spec's literal path, the same node derive_cash_domain_node
   returns.
 cash_node_to_cx1(node) -> Cx1   hand this out, never the node
-derive_note_pubkey(branch_pubkey_x_only, chain_code, i) -> 32-byte x-only Q,
-  used as is (no BIP-86 tweak). watch-only. t = tagged_hash("LNURLcash/derive",
-  P || chain_code || ser32_be(i)); i is any uint32, never hardened. t is reduced
+derive_note_pubkey(branch_pubkey_x_only, chain_code, i, purpose=PURPOSE_WALLET)
+  -> 32-byte x-only Q, used as is (no BIP-86 tweak). watch-only.
+  t = tagged_hash("LNURLcash/derive", P || chain_code || ser32_be(purpose) ||
+  ser32_be(i)); purpose and i are any uint32, never hardened. t is reduced
   mod n; a zero key raises ProtocolError: use the next i.
-derive_note_secret_key(branch_private_key, chain_code, i) -> 32 bytes
+  PURPOSE_WALLET=0 (the wallet's own notes and a split's p1), PURPOSE_CHANGE=1
+  (a split's p2), PURPOSE_LIGHTNING_ADDRESS=2 (auto-mint and internal
+  transfer). One counter per purpose; recovery scans each. The address proof
+  and the address key are purpose 0, index 0.
+derive_note_secret_key(branch_private_key, chain_code, i, purpose=PURPOSE_WALLET)
+  -> 32 bytes
 sign_note_ownership(sk, domain) -> 96 bytes Q || BIP-340 sig over
   key_path_sighash(Q, domain), zero aux_rand: one deterministic ck1 per mint
 recover_note_ownership_pubkey(payload, domain) -> NoteOwnership(pubkey_x_only,

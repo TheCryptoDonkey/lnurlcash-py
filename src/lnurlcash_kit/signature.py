@@ -209,7 +209,7 @@ def verify_note_signature_for_key(
 
 def verify_note_url(note_url: str, mint_pubkey_hex: str) -> tuple[int | None, Certification]:
     """LUD-25's offline check on a note URL as a recipient holds it,
-    ``lnurlw://mint.example/w?k1=<spend>&sig=<cs1>``: the spend from ``k1``,
+    ``lnurlw://mint.example/w?k1=<spend>&c=<cs1>``: the spend from ``k1``,
     the domain from the URL's own host, and the amount from the cs1, or from
     the URL's ``amount`` when the certificate is an older one that carries
     none. Returns that amount with the verdict, the amount None when there was

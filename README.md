@@ -141,7 +141,8 @@ not. If you pass your own client, do not configure a retrying transport.
 certify every note with a `cs1` over its `hex(Q)`, a bearer note included; it
 is a SHOULD, and a mint with no signer omits it. A rotate, split or merge to
 an output named by a `cp1` that the service confirms without its `cs1` (in
-`sig`, or `sig2` for a split's change) raises `UnverifiableNote`, whatever the
+`c`, or `c2` for a split's change; a mint from before luds `50d740a` sends
+`sig`/`sig2`, which are still read) raises `UnverifiableNote`, whatever the
 policy says: offline verification is the reason to name a note that way. An
 output named by a bearer `h` may have `signature=None`.
 
@@ -236,16 +237,22 @@ lowercase hostname (`spend_domain_of`):
 from lnurlcash_kit import (
     cash_node_to_cx1, derive_cash_address_node, derive_cash_root,
     derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1,
-    encode_cx1, sign_note_ownership,
+    encode_cx1, sign_note_ownership, PURPOSE_WALLET,
 )
 
 node = derive_cash_address_node(derive_cash_root(seed), "mint.example")
 branch = cash_node_to_cx1(node)
 watch_only = encode_cx1(branch.pubkey_x_only, branch.chain_code)
 
-pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i)  # Q, used as is
-sk = derive_note_secret_key(node.private_key, node.chain_code, i)
+pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i, PURPOSE_WALLET)  # Q, used as is
+sk = derive_note_secret_key(node.private_key, node.chain_code, i, PURPOSE_WALLET)
 ck1 = encode_ck1(sign_note_ownership(sk, "mint.example"))           # spends at mint.example only
+
+# purpose splits the branch into three counters: PURPOSE_WALLET (0: notes the
+# wallet mints, rotates or merges into, and a split's p1), PURPOSE_CHANGE (1: a
+# split's change, p2) and PURPOSE_LIGHTNING_ADDRESS (2: notes a mint credits by
+# Lightning Address auto-mint or internal transfer). Scan each on recovery.
+# t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(purpose) || ser32(i))
 
 client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1; its cs1 is owed
 ```
@@ -297,7 +304,7 @@ took that parameter first). A `cp1` whose key is not a curve point is refused
 before anything is sent.
 
 Reference-mint address management proves control with the address branch's
-index-0 key. `sign_address_proof(sk0, action, domain, username)` returns the
+purpose-0 index-0 key. `sign_address_proof(sk0, action, domain, username)` returns the
 raw 64-byte BIP-340 proof over
 `sha256("LNURLcash:<action>:<domain>:<username>")`; action is `register` or
 `unregister`, the domain is the mint's own, and the username must be

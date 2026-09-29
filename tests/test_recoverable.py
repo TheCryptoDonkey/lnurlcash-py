@@ -38,6 +38,9 @@ from lnurlcash_kit import (
     derive_cash_child,
     derive_cash_master,
     derive_cash_root,
+    PURPOSE_CHANGE,
+    PURPOSE_LIGHTNING_ADDRESS,
+    PURPOSE_WALLET,
     derive_note_pubkey,
     derive_note_secret_key,
     derive_nostr_cash_seed,
@@ -54,11 +57,14 @@ from lnurlcash_kit import (
     new_secrets_of,
     note_id_of,
     note_lookup_of,
+    note_signature,
     note_signature_message,
     recover_note_ownership_pubkey,
     resolve_note_input,
     sign_note_ownership,
     verify_note_signature,
+    with_new_k1,
+    without_k1,
     verify_spend,
 )
 from lnurlcash_kit import bech32, recoverable
@@ -269,7 +275,7 @@ def test_the_signed_message_is_over_the_key_for_a_ck1(notes):
 
 def test_a_note_url_may_carry_a_ck1_but_not_a_cp1(notes, cert):
     a = notes[0]
-    url = f"https://mint.example/w?k1={a['ck1']}&amount=1000&sig={cert['cs1']}"
+    url = f"https://mint.example/w?k1={a['ck1']}&amount=1000&c={cert['cs1']}"
     assert resolve_note_input(url) == url
     assert resolve_note_input(f"lnurlw://MINT.EXAMPLE/w?k1={a['ck1']}") is not None
     # signed for one mint, it is no note at another
@@ -346,7 +352,7 @@ def test_a_lookup_by_cp1_brings_back_a_certificate_that_verifies(part2, notes, c
             "minWithdrawable": cert["amountMsat"],
             "maxWithdrawable": cert["amountMsat"],
             "mintPubkey": part2["mint"]["mintPubkey"],
-            "sig": cert["cs1"],
+            "c": cert["cs1"],
         }
     )
     assert info.signature == cert["cs1"]
@@ -366,7 +372,7 @@ def test_rotate_a_ck1_into_a_cp1_sent_as_p1(notes, cert):
     request = rotate_request_with_hash(CB, a["ck1"], b["cp1"])
     assert query(request.url) == {"k1": [a["ck1"]], "p1": [b["cp1"]]}
     assert request.replayable is True
-    assert request.parse({"status": "OK", "sig": cert["cs1"]}).signature == cert["cs1"]
+    assert request.parse({"status": "OK", "c": cert["cs1"]}).signature == cert["cs1"]
 
 
 def test_a_bearer_output_goes_as_p1_too(notes):
@@ -429,13 +435,13 @@ def test_an_uncertified_cp1_output_is_unverifiable_whatever_the_policy(notes, po
             policy=policy,
         ),
     ):
-        for body in ({"status": "OK"}, {"status": "OK", "sig": ""}):
+        for body in ({"status": "OK"}, {"status": "OK", "c": ""}):
             with pytest.raises(UnverifiableNote):
                 request.parse(body)
 
 
 @pytest.mark.parametrize("policy", _EVERY_POLICY, ids=repr)
-def test_a_cp1_change_without_sig2_is_unverifiable_whatever_the_policy(
+def test_a_cp1_change_without_c2_is_unverifiable_whatever_the_policy(
     notes, cert, policy
 ):
     a, b, c = notes[0], notes[1], notes[2]
@@ -445,21 +451,21 @@ def test_a_cp1_change_without_sig2_is_unverifiable_whatever_the_policy(
         policy=policy,
     )
     with pytest.raises(UnverifiableNote):
-        behind_a_hash.parse({"status": "OK", "sig": _PART1_SIG})
+        behind_a_hash.parse({"status": "OK", "c": _PART1_SIG})
     both_keys = _with_policy(
         split_request_with_hash, CB, [a["ck1"]], 5000, b["cp1"], c["cp1"],
         policy=policy,
     )
     with pytest.raises(UnverifiableNote):
-        both_keys.parse({"status": "OK", "sig": cert["cs1"]})
-    certified = both_keys.parse({"status": "OK", "sig": cert["cs1"], "sig2": cert["cs1"]})
+        both_keys.parse({"status": "OK", "c": cert["cs1"]})
+    certified = both_keys.parse({"status": "OK", "c": cert["cs1"], "c2": cert["cs1"]})
     assert certified.signature == certified.change_signature == cert["cs1"]
 
 
 def test_a_hash_change_beside_a_certified_cp1_is_a_plain_note(notes, cert):
     a, b = notes[0], notes[1]
     request = split_request_with_hash(CB, [a["ck1"]], 5000, b["cp1"], hash_k1(K1))
-    result = request.parse({"status": "OK", "sig": cert["cs1"]})
+    result = request.parse({"status": "OK", "c": cert["cs1"]})
     assert result.signature == cert["cs1"]
     assert result.change_signature is None
     # unless the caller asks for the Part 1 signature over the hash
@@ -467,7 +473,7 @@ def test_a_hash_change_beside_a_certified_cp1_is_a_plain_note(notes, cert):
         CB, [a["ck1"]], 5000, b["cp1"], hash_k1(K1), Policy(require_signatures=True)
     )
     with pytest.raises(UnverifiableNote):
-        strict.parse({"status": "OK", "sig": cert["cs1"]})
+        strict.parse({"status": "OK", "c": cert["cs1"]})
 
 
 def test_an_uncertified_cp1_hands_back_nothing_it_never_held(notes):
@@ -496,7 +502,7 @@ def test_the_client_sends_a_ck1_and_a_cp1_exactly_as_built(notes, cert):
 
     def answer(request: httpx.Request) -> httpx.Response:
         seen.append(request.url)
-        return httpx.Response(200, json={"status": "OK", "sig": cert["cs1"]})
+        return httpx.Response(200, json={"status": "OK", "c": cert["cs1"]})
 
     with httpx.Client(transport=httpx.MockTransport(answer)) as http:
         result = LnurlcashClient(client=http).rotate_note_with_hash(CB, a["ck1"], b["cp1"])
@@ -759,3 +765,50 @@ def test_a_cx1_round_trips(part2):
     assert encode_cp1(derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, 0)) == (
         branch["notes"][0]["cp1"]
     )
+
+
+# ---- the purpose input to the tweak, and the sig -> c rename ----
+
+
+def test_purposes_are_independent_counters(part2):
+    sk, pk, chain = _branch(part2)
+    keys = {
+        purpose: derive_note_pubkey(pk, chain, 0, purpose)
+        for purpose in (PURPOSE_WALLET, PURPOSE_CHANGE, PURPOSE_LIGHTNING_ADDRESS)
+    }
+    assert (PURPOSE_WALLET, PURPOSE_CHANGE, PURPOSE_LIGHTNING_ADDRESS) == (0, 1, 2)
+    assert len(set(keys.values())) == 3
+    # the default is the wallet purpose
+    assert derive_note_pubkey(pk, chain, 0) == keys[PURPOSE_WALLET]
+    for purpose, key in keys.items():
+        secret = derive_note_secret_key(sk, chain, 0, purpose)
+        assert PrivateKey(secret).public_key_xonly.format() == key
+
+
+def test_the_purpose_is_a_uint32_too(part2):
+    sk, pk, chain = _branch(part2)
+    for bad in [-1, 2**32, 1.5, True, "0"]:
+        with pytest.raises(ProtocolError):
+            derive_note_pubkey(pk, chain, 0, bad)
+        with pytest.raises(ProtocolError):
+            derive_note_secret_key(sk, chain, 0, bad)
+
+
+def test_the_legacy_sig_names_are_still_read_and_c_wins(notes, cert):
+    a, b, c = notes[0], notes[1], notes[2]
+    split = split_request_with_hash(CB, [a["ck1"]], 5000, b["cp1"], c["cp1"])
+    legacy = split.parse({"status": "OK", "sig": cert["cs1"], "sig2": cert["cs1"]})
+    assert legacy.signature == legacy.change_signature == cert["cs1"]
+    current = split.parse({"status": "OK", "c": cert["cs1"], "c2": cert["cs1"], "sig": "x"})
+    assert current.signature == current.change_signature == cert["cs1"]
+
+
+def test_a_note_url_carries_c_and_still_reads_sig(notes, cert):
+    a = notes[0]
+    legacy = f"https://mint.example/w?k1={a['ck1']}&sig={cert['cs1']}"
+    current = f"https://mint.example/w?k1={a['ck1']}&c={cert['cs1']}"
+    assert note_signature(legacy) == note_signature(current) == cert["cs1"]
+    # writing always uses the new name, and replaces a legacy one
+    assert query(with_new_k1(legacy, a["ck1"], 1000, cert["cs1"]))["c"] == [cert["cs1"]]
+    assert "sig" not in query(with_new_k1(legacy, a["ck1"], 1000, cert["cs1"]))
+    assert "sig" not in query(without_k1(legacy, 1000, cert["cs1"]))
